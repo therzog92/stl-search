@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{% block title %}STL Search{% endblock %}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,700;1,9..40,400&family=Fraunces:opsz,wght@9..144,600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body class="{% block body_class %}{% endblock %}">
+    {% block topbar %}
+    <header class="site-top">
+      <a class="site-logo" href="/">STL Search</a>
+      <nav class="site-nav" aria-label="Main">
+        <a class="site-nav-link" href="/" data-nav="home">Home</a>
+        <a class="site-nav-link" href="/#favorites" data-nav="favorites">Favorites</a>
+        <a class="site-nav-link" href="/manage" data-nav="manage">Manage</a>
+        <a class="site-nav-link" href="/downloads" data-nav="downloads">Downloads</a>
+      </nav>
+    </header>
+    {% endblock %}
+    {% block body %}{% endblock %}
+    {% block topbar_end %}
+    <button type="button" class="back-to-top" id="back-to-top" hidden aria-label="Back to top" title="Back to top">
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" focusable="false">
+        <path
+          fill="currentColor"
+          d="M12 5.5 4.8 12.2a1 1 0 0 0 1.4 1.4L11 8.9V19a1 1 0 1 0 2 0V8.9l4.8 4.7a1 1 0 0 0 1.4-1.4L12 5.5z"
+        />
+      </svg>
+    </button>
+    {% endblock %}
+    <script>
+      (function () {
+        function syncNav() {
+          const path = location.pathname.replace(/\/$/, "") || "/";
+          const hash = location.hash || "";
+          document.querySelectorAll(".site-nav-link[data-nav]").forEach((a) => {
+            const key = a.getAttribute("data-nav");
+            let active = false;
+            if (key === "home") {
+              active =
+                (path === "/" && hash !== "#favorites") ||
+                path === "/results" ||
+                path.startsWith("/channel/");
+            } else if (key === "favorites") {
+              active = path === "/" && hash === "#favorites";
+            } else if (key === "manage") active = path === "/manage";
+            else if (key === "downloads") active = path === "/downloads";
+            a.classList.toggle("is-active", active);
+          });
+        }
+        syncNav();
+        window.addEventListener("hashchange", syncNav);
+
+        const topBtn = document.getElementById("back-to-top");
+        if (topBtn) {
+          const syncTopBtn = () => {
+            topBtn.hidden = window.scrollY < 280;
+          };
+          topBtn.addEventListener("click", () => {
+            window.scrollTo({ top: 0, behavior: "smooth" });
+          });
+          window.addEventListener("scroll", syncTopBtn, { passive: true });
+          syncTopBtn();
+        }
+      })();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}Downloads · STL Search{% endblock %}
+{% block body %}
+<div class="shell">
+  <header class="brand">
+    <div>
+      <h1>Download history</h1>
+      <p>
+        Finished downloads stay here after you clear the live dock.
+        PC folder path: <code>{{ download_dir }}</code>
+      </p>
+    </div>
+    {% if history %}
+    <form method="post" action="/downloads/clear-history" onsubmit="return confirm('Clear all download history?');">
+      <button class="btn secondary" type="submit">Clear history</button>
+    </form>
+    {% endif %}
+  </header>
+
+  <section class="panel">
+    {% if history %}
+    <div class="history-list">
+      {% for j in history %}
+      <article class="history-card status-{{ j.status }}">
+        <div class="history-card-top">
+          <div class="history-name" title="{{ j.path or j.filename }}">{{ j.filename or "—" }}</div>
+          <span class="badge history-status status-{{ j.status }}">
+            {% if j.status == "done" %}done
+            {% elif j.status == "cancelled" %}cancelled
+            {% elif j.status == "error" %}failed
+            {% else %}{{ j.status }}{% endif %}
+          </span>
+        </div>
+        {% if j.extract_note %}
+        <div class="history-note">{{ j.extract_note }}</div>
+        {% elif j.error %}
+        <div class="history-note history-note-error">{{ j.error }}</div>
+        {% endif %}
+        <div class="history-meta">
+          <span>{{ (j.finished_at or j.created_at or "")[:19]|replace("T", " ") }}</span>
+          {% if j.channel %}
+          <a href="/channel/{{ j.channel }}">@{{ j.channel }}</a>
+          {% endif %}
+          <span>{{ "PC folder" if j.mode == "desktop" else "This device" }}</span>
+        </div>
+      </article>
+      {% endfor %}
+    </div>
+    {% else %}
+    <p class="hint" style="margin: 0">No download history yet. Downloads from search/browse will show up here after they finish.</p>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

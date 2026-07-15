@@ -1,0 +1,5 @@
+# Seed channel usernames (one per line, no @).
+# Edit after install — or Manage channels in the web UI.
+allstll
+STLforest
+stl_zone

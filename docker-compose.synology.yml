@@ -1,0 +1,22 @@
+# Marius-style Synology stack — pull a ready image (no build on the NAS).
+# Used by install-synology.sh
+#
+# Before first start, create /volume1/docker/stl-search/.env from .env.example
+# (TELEGRAM_API_ID + TELEGRAM_API_HASH required).
+
+services:
+  stl-search:
+    image: ghcr.io/therzog92/stl-search:latest
+    container_name: stl-search
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    env_file:
+      - .env
+    environment:
+      STL_HOST: "0.0.0.0"
+      STL_PORT: "8787"
+      STL_DOWNLOAD_DIR: "/downloads"
+    volumes:
+      - /volume1/docker/stl-search/data:/app/data
+      - /volume1/docker/stl-search/downloads:/downloads

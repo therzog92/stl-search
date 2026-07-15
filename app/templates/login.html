@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Login · STL Search{% endblock %}
+{% block topbar %}{% endblock %}
+{% block body_class %}login-page{% endblock %}
+{% block body %}
+<div class="login-wrap">
+  <h1>STL Search</h1>
+  <p class="hint" style="margin-bottom: 1.25rem">
+    Sign in with your Telegram account once. The session stays on this machine.
+  </p>
+
+  <div class="panel">
+    {% if error %}
+    <div class="error">{{ error }}</div>
+    {% endif %}
+
+    {% if step == "phone" %}
+    <form method="post" action="/login/phone">
+      <label for="phone">Phone number (international format)</label>
+      <input
+        id="phone"
+        name="phone"
+        type="tel"
+        placeholder="+15551234567"
+        value="{{ phone or '' }}"
+        required
+        autofocus
+      />
+      <button class="btn" type="submit">Send code</button>
+    </form>
+    {% elif step == "code" %}
+    <form method="post" action="/login/code">
+      <input type="hidden" name="phone" value="{{ phone }}" />
+      <label for="code">Login code from Telegram</label>
+      <input id="code" name="code" type="text" inputmode="numeric" required autofocus />
+      <button class="btn" type="submit">Verify</button>
+    </form>
+    {% elif step == "password" %}
+    <form method="post" action="/login/code">
+      <input type="hidden" name="phone" value="{{ phone }}" />
+      <input type="hidden" name="code" value="{{ code }}" />
+      <label for="password">Two-factor password</label>
+      <input id="password" name="password" type="password" required autofocus />
+      <button class="btn" type="submit">Unlock</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

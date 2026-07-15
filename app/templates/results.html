@@ -1,0 +1,808 @@
+{% extends "base.html" %}
+{% block title %}{% if browse %}{{ browse_title or browse_username }} · Browse{% else %}Results · STL Search{% endif %}{% endblock %}
+{% block body %}
+<div class="shell" data-browse="{{ '1' if browse else '0' }}">
+  <header class="brand">
+    <div>
+      <h1>{% if browse %}{{ browse_title or browse_username }}{% else %}Results{% endif %}</h1>
+      <p>
+        {% if browse %}
+          Files in <strong>@{{ browse_username }}</strong> · newest first
+        {% elif state.query %}
+          Query: <strong>{{ state.query }}</strong>
+        {% else %}
+          Waiting for a search…
+        {% endif %}
+      </p>
+    </div>
+    <div class="header-actions">
+      {% if not browse %}
+      <a class="btn secondary btn-sm" href="/">New search</a>
+      {% endif %}
+    </div>
+  </header>
+
+  <div class="search-status-sticky" id="status-sticky">
+    <div class="search-status-row">
+      <span class="search-status-chip" id="status">{{ state.status }}</span>
+      <span class="search-status-progress" id="progress-text" title="{{ state.progress }}">{{ state.progress }}</span>
+      {% if not browse %}
+      <span class="search-status-meta">
+        <strong id="channel-progress">{{ state.channels_scanned }}/{{ state.channels_total }}</strong> ch
+      </span>
+      {% else %}
+      <span class="search-status-meta" id="channel-progress-wrap" hidden>
+        <strong id="channel-progress">{{ state.channels_scanned }}/{{ state.channels_total }}</strong>
+      </span>
+      {% endif %}
+      <span class="search-status-meta">
+        <strong id="hit-count">{{ state.results|length }}</strong> files
+        <span class="muted-sep" id="source-count-wrap"></span>
+      </span>
+      <button type="button" class="btn btn-stop" id="stop-search-btn" {% if not state.running %}hidden{% endif %}>
+        {% if browse %}Stop browse{% else %}Stop search{% endif %}
+      </button>
+    </div>
+    <div class="progress-track progress-track-compact">
+      <div class="progress-fill" id="progress-fill"></div>
+    </div>
+    {% if variants %}
+    <div class="search-status-variants hint">
+      {% for v in variants %}<span class="pill">{{ v }}</span>{% endfor %}
+    </div>
+    {% endif %}
+    <div id="errors"></div>
+  </div>
+
+  <section class="panel">
+    <div class="matches-header">
+      <div>
+        <h2>{% if browse %}Files{% else %}Matches{% endif %}</h2>
+        <p class="hint" style="margin: 0.25rem 0 0">
+          {% if browse %}
+            STL / 3MF / ZIP (and RAR / 7Z) posts from this channel, with previews when available.
+          {% else %}
+            Same filename + size are grouped; channels appear under each file.
+          {% endif %}
+        </p>
+      </div>
+      {% if not browse %}
+      <div class="sort-toggle" role="group" aria-label="Sort results">
+        <button type="button" class="sort-btn is-active" data-sort="arrival" id="sort-arrival">
+          Arrival order
+        </button>
+        <button type="button" class="sort-btn" data-sort="date" id="sort-date">
+          Newest files
+        </button>
+      </div>
+      {% endif %}
+    </div>
+    {% if not browse %}
+    <p class="hint" id="sort-hint" style="margin-bottom: 1rem">
+      New files append at the bottom as they are found.
+    </p>
+    {% else %}
+    <p class="hint" id="sort-hint" style="margin-bottom: 1rem">
+      Showing newest posts first as files load.
+    </p>
+    {% endif %}
+    <div class="results" id="results">
+      <div class="empty" id="empty-state">
+        {% if browse %}Loading files…{% else %}Searching… results will appear here as they are found.{% endif %}
+      </div>
+    </div>
+  </section>
+</div>
+
+<dialog id="download-modal" class="download-modal">
+  <form method="dialog" class="download-modal-inner">
+    <h2>Download file</h2>
+    <p class="hint" id="download-modal-name" style="margin-top: 0"></p>
+    <p class="hint" id="download-modal-status" hidden></p>
+    <div class="download-choices" id="download-choices">
+      <button type="button" class="btn" id="dl-desktop-btn">
+        Save to PC folder
+        <span class="dl-sub">Queues on the hosting PC · {{ download_dir }}</span>
+      </button>
+      <button type="button" class="btn secondary" id="dl-local-btn">
+        Download to this device
+        <span class="dl-sub">Queues, then saves to phone/browser Downloads</span>
+      </button>
+    </div>
+    <div class="download-conflict" id="download-conflict" hidden>
+      <p class="hint" id="download-conflict-msg" style="margin-top: 0"></p>
+      <div class="download-choices" id="download-conflict-choices">
+        <button type="button" class="btn" id="dl-conflict-proceed">
+          Download anyway
+          <span class="dl-sub" id="dl-conflict-suggested">Saves as a copy with (1), etc.</span>
+        </button>
+        <button type="button" class="btn secondary" id="dl-conflict-cancel">
+          Keep existing
+          <span class="dl-sub">Don’t download a duplicate</span>
+        </button>
+      </div>
+    </div>
+    <button type="submit" class="btn secondary download-cancel" value="cancel">Cancel</button>
+  </form>
+</dialog>
+
+<div class="download-dock" id="download-dock" hidden>
+  <div class="download-dock-head">
+    <strong>Downloads</strong>
+    <div class="download-dock-actions">
+      <a class="btn secondary btn-sm" href="/downloads">History</a>
+      <button type="button" class="btn secondary btn-sm" id="download-dock-clear">Clear done</button>
+    </div>
+  </div>
+  <div class="download-dock-list" id="download-dock-list"></div>
+</div>
+
+<script>
+  const BROWSE_MODE = {{ "true" if browse else "false" }};
+  const DOWNLOAD_DIR = {{ (download_dir or "") | tojson }};
+  /** @type {"arrival"|"date"} */
+  let sortMode = BROWSE_MODE ? "date" : "arrival";
+  let arrivalSeq = 0;
+  /** @type {Map<string, {data: object, el: HTMLElement, arrival: number}>} */
+  const groups = new Map();
+  // pendingDownload: { channel, messageId, fileName } or null
+  let pendingDownload = null;
+
+  const SORT_HINTS = {
+    arrival: "New files append at the bottom as they are found.",
+    date: BROWSE_MODE
+      ? "Newest posts first."
+      : "Sorted by earliest channel post for each file (newest first).",
+  };
+
+  function formatBytes(n) {
+    if (!n) return "";
+    const units = ["B", "KB", "MB", "GB"];
+    let i = 0;
+    let v = n;
+    while (v >= 1024 && i < units.length - 1) {
+      v /= 1024;
+      i += 1;
+    }
+    return `${v.toFixed(i ? 1 : 0)} ${units[i]}`;
+  }
+
+  function escapeHtml(s) {
+    return String(s)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;");
+  }
+
+  function groupKey(r) {
+    return r.group_key || `${r.file_name || ""}|${r.file_size || 0}|${r.channel_username}:${r.message_id}`;
+  }
+
+  function earliestSourceDate(r) {
+    const list = r.sources || [];
+    let best = "";
+    for (const s of list) {
+      const d = s.date || "";
+      if (d && (!best || d < best)) best = d;
+    }
+    return best || r.date || "";
+  }
+
+  function newestSource(r) {
+    const list = r.sources || [];
+    if (!list.length) {
+      return {
+        channel_username: r.channel_username,
+        message_id: r.message_id,
+        message_link: r.message_link || "",
+      };
+    }
+    let best = list[0];
+    for (const s of list) {
+      if ((s.date || "") > (best.date || "")) best = s;
+    }
+    return best;
+  }
+
+  function newestSourceLink(r) {
+    return newestSource(r).message_link || r.message_link || "";
+  }
+
+  function sourcesHtml(sources) {
+    const list = [...(sources || [])].sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+    if (!list.length) return "";
+    const items = list
+      .map((s) => {
+        const title = escapeHtml(s.channel_title || s.channel_username);
+        const date = s.date ? ` · ${escapeHtml(s.date)}` : "";
+        return `<li>
+          <a href="${s.message_link}" target="_blank" rel="noopener">${title}</a>
+          <span class="source-meta">@${escapeHtml(s.channel_username)}${date}</span>
+          <a class="source-open" href="${s.message_link}" target="_blank" rel="noopener">Open</a>
+        </li>`;
+      })
+      .join("");
+    return `<ul class="source-list">${items}</ul>`;
+  }
+
+  function metaHtml(r) {
+    const n = (r.sources || []).length;
+    const size = formatBytes(r.file_size);
+    const ext = r.file_ext ? `<span class="pill">${escapeHtml(r.file_ext)}</span>` : "";
+    const matched = !BROWSE_MODE && r.query_matched
+      ? `· matched “${escapeHtml(r.query_matched)}”`
+      : "";
+    const dateLabel = BROWSE_MODE ? "posted" : "first seen";
+    const earliest = earliestSourceDate(r);
+    const channelPill = BROWSE_MODE
+      ? ""
+      : `<span class="pill">${n} channel${n === 1 ? "" : "s"}</span>`;
+    return `
+      ${channelPill}
+      ${ext}
+      ${size ? `<span class="pill">${size}</span>` : ""}
+      ${matched}
+      ${earliest ? `· ${dateLabel} ${escapeHtml(earliest)}` : ""}`;
+  }
+
+  function renderGroup(r) {
+    const title = r.file_name || `Message #${r.message_id}`;
+    const thumb = r.thumb_url
+      ? `<img src="${r.thumb_url}" alt="" loading="lazy" />`
+      : `<div class="placeholder">No preview</div>`;
+    const snip = r.text ? `<div class="snippet">${escapeHtml(r.text)}</div>` : "";
+    const primary = newestSourceLink(r) || "#";
+    const src = newestSource(r);
+    const channel = escapeHtml(src.channel_username || r.channel_username || "");
+    const mid = src.message_id || r.message_id || 0;
+    const sourcesBlock = BROWSE_MODE
+      ? ""
+      : `<div class="sources-wrap">
+            <div class="sources-label">Found in</div>
+            ${sourcesHtml(r.sources)}
+          </div>`;
+    const openLabel = BROWSE_MODE ? "Open in Telegram" : "Open latest";
+    return `
+      <article class="result" data-key="${escapeHtml(groupKey(r))}">
+        <div class="thumb">${thumb}</div>
+        <div class="result-body">
+          <h3>${escapeHtml(title)}</h3>
+          <div class="meta">${metaHtml(r)}</div>
+          ${snip}
+          ${sourcesBlock}
+        </div>
+        <div class="result-actions">
+          <a class="btn btn-open" href="${primary}" target="_blank" rel="noopener">${openLabel}</a>
+          <button
+            type="button"
+            class="btn secondary btn-download"
+            data-channel="${channel}"
+            data-message-id="${mid}"
+            data-file-name="${escapeHtml(title)}"
+          >Download</button>
+        </div>
+      </article>`;
+  }
+
+  function fingerprint(r) {
+    const sources = r.sources || [];
+    const srcPart = sources
+      .map((s) => `${s.channel_username}:${s.message_id}:${s.date || ""}`)
+      .join(",");
+    return [
+      r.thumb_url || "",
+      r.file_name || "",
+      r.file_size || 0,
+      r.text || "",
+      r.query_matched || "",
+      earliestSourceDate(r),
+      sources.length,
+      srcPart,
+    ].join("|");
+  }
+
+  function flashCard(el, kind) {
+    if (!el) return;
+    const cls = kind === "update" ? "card-flash-update" : "card-flash-new";
+    el.classList.remove("card-flash-new", "card-flash-update");
+    void el.offsetWidth;
+    el.classList.add(cls);
+    window.clearTimeout(el._flashTimer);
+    el._flashTimer = window.setTimeout(() => {
+      el.classList.remove(cls);
+    }, 750);
+  }
+
+  function updateGroupEl(el, r) {
+    const thumb = el.querySelector(".thumb");
+    if (r.thumb_url && thumb && !thumb.querySelector("img")) {
+      thumb.innerHTML = `<img src="${r.thumb_url}" alt="" loading="lazy" />`;
+    }
+    const meta = el.querySelector(".meta");
+    if (meta) meta.innerHTML = metaHtml(r);
+    const wrap = el.querySelector(".sources-wrap");
+    if (wrap && !BROWSE_MODE) {
+      wrap.innerHTML = `<div class="sources-label">Found in</div>${sourcesHtml(r.sources)}`;
+    }
+    const openBtn = el.querySelector(".result-actions .btn-open");
+    if (openBtn) {
+      const link = newestSourceLink(r);
+      if (link) openBtn.href = link;
+    }
+    const dlBtn = el.querySelector(".btn-download");
+    if (dlBtn) {
+      const src = newestSource(r);
+      dlBtn.dataset.channel = src.channel_username || r.channel_username || "";
+      dlBtn.dataset.messageId = String(src.message_id || r.message_id || 0);
+      dlBtn.dataset.fileName = r.file_name || `Message #${r.message_id}`;
+    }
+  }
+
+  function sortedEntries() {
+    const entries = [...groups.values()];
+    if (sortMode === "date") {
+      entries.sort((a, b) => {
+        const da = earliestSourceDate(a.data);
+        const db = earliestSourceDate(b.data);
+        const cmp = db.localeCompare(da);
+        if (cmp !== 0) return cmp;
+        return a.arrival - b.arrival;
+      });
+    } else {
+      entries.sort((a, b) => a.arrival - b.arrival);
+    }
+    return entries;
+  }
+
+  function applySortOrder() {
+    const root = document.getElementById("results");
+    if (!root || !groups.size) return;
+
+    const entries = sortedEntries();
+    const desired = entries.map((e) => e.el);
+    const current = [...root.querySelectorAll(".result")];
+    if (
+      desired.length === current.length &&
+      desired.every((el, i) => el === current[i])
+    ) {
+      return;
+    }
+    for (const entry of entries) {
+      root.appendChild(entry.el);
+    }
+  }
+
+  function upsertResults(results) {
+    const root = document.getElementById("results");
+    const empty = document.getElementById("empty-state");
+    if (!results.length) return;
+    if (empty) empty.remove();
+
+    let needReorder = false;
+    for (const r of results) {
+      const key = groupKey(r);
+      const fp = fingerprint(r);
+      const existing = groups.get(key);
+      if (!existing) {
+        root.insertAdjacentHTML("beforeend", renderGroup(r));
+        const el = root.querySelector(`.result[data-key="${CSS.escape(key)}"]`);
+        if (!el) continue;
+        groups.set(key, { data: r, el, arrival: arrivalSeq++, fp });
+        flashCard(el, "new");
+        needReorder = sortMode === "date";
+        continue;
+      }
+      if (existing.fp === fp) {
+        continue;
+      }
+      const prevEarliest = earliestSourceDate(existing.data);
+      existing.data = r;
+      existing.fp = fp;
+      updateGroupEl(existing.el, r);
+      flashCard(existing.el, "update");
+      if (sortMode === "date" && earliestSourceDate(r) !== prevEarliest) {
+        needReorder = true;
+      }
+    }
+
+    if (needReorder) {
+      applySortOrder();
+    }
+  }
+
+  function setSortMode(mode) {
+    sortMode = mode;
+    document.querySelectorAll(".sort-btn").forEach((btn) => {
+      btn.classList.toggle("is-active", btn.dataset.sort === mode);
+    });
+    const hint = document.getElementById("sort-hint");
+    if (hint) hint.textContent = SORT_HINTS[mode] || "";
+    applySortOrder();
+  }
+
+  async function tick() {
+    const res = await fetch("/api/status");
+    const data = await res.json();
+    const statusChip = document.getElementById("status");
+    statusChip.textContent = data.status;
+    statusChip.classList.remove("done", "error", "stopped");
+    if (data.status === "done") statusChip.classList.add("done");
+    if (data.status === "error") statusChip.classList.add("error");
+    if (data.status === "stopped") statusChip.classList.add("stopped");
+
+    const stopBtn = document.getElementById("stop-search-btn");
+    if (stopBtn) {
+      stopBtn.hidden = !data.running;
+      if (!data.running) {
+        stopBtn.disabled = false;
+        stopBtn.textContent = BROWSE_MODE ? "Stop browse" : "Stop search";
+      }
+    }
+    const progressEl = document.getElementById("progress-text");
+    progressEl.textContent = data.progress || "";
+    progressEl.title = data.progress || "";
+    const chProg = document.getElementById("channel-progress");
+    if (chProg) {
+      chProg.textContent = `${data.channels_scanned}/${data.channels_total}`;
+    }
+    document.getElementById("hit-count").textContent = data.result_count;
+    const srcWrap = document.getElementById("source-count-wrap");
+    if (srcWrap && data.source_count && !BROWSE_MODE) {
+      srcWrap.textContent = ` · ${data.source_count} posts`;
+    }
+
+    const pct =
+      data.channels_total > 0
+        ? Math.round((data.channels_scanned / Math.max(data.channels_total, 1)) * 100)
+        : data.running
+          ? 8
+          : data.status === "done"
+            ? 100
+            : data.status === "stopped"
+              ? Math.round((data.channels_scanned / Math.max(data.channels_total, 1)) * 100)
+              : 0;
+    // Browse fills progress by file count approx
+    let fill = pct;
+    if (BROWSE_MODE) {
+      fill = data.running
+        ? Math.min(90, 10 + (data.result_count || 0) * 0.5)
+        : data.status === "done" || data.status === "stopped"
+          ? 100
+          : 0;
+    }
+    document.getElementById("progress-fill").style.width = `${fill}%`;
+
+    const err = document.getElementById("errors");
+    if (data.errors && data.errors.length) {
+      err.innerHTML = `<div class="error">${data.errors.map(escapeHtml).join("<br>")}</div>`;
+    } else {
+      err.innerHTML = "";
+    }
+
+    upsertResults(data.results || []);
+
+    if (data.running) {
+      setTimeout(tick, 600);
+    } else if (!data.result_count) {
+      const root = document.getElementById("results");
+      if (!root.querySelector(".result")) {
+        root.innerHTML = `<div class="empty" id="empty-state">${
+          BROWSE_MODE ? "No matching files in this channel." : "No matches found."
+        }</div>`;
+      }
+    }
+  }
+
+  tick();
+
+  document.querySelectorAll(".sort-btn").forEach((btn) => {
+    btn.addEventListener("click", () => setSortMode(btn.dataset.sort));
+  });
+
+  document.getElementById("stop-search-btn")?.addEventListener("click", async () => {
+    const btn = document.getElementById("stop-search-btn");
+    if (!btn || btn.disabled) return;
+    btn.disabled = true;
+    btn.textContent = "Stopping…";
+    try {
+      await fetch("/search/stop", { method: "POST" });
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = BROWSE_MODE ? "Stop browse" : "Stop search";
+    }
+  });
+
+  const modal = document.getElementById("download-modal");
+  const modalName = document.getElementById("download-modal-name");
+  const modalStatus = document.getElementById("download-modal-status");
+  const desktopBtn = document.getElementById("dl-desktop-btn");
+  const localBtn = document.getElementById("dl-local-btn");
+  const downloadChoices = document.getElementById("download-choices");
+  const conflictBox = document.getElementById("download-conflict");
+  const conflictMsg = document.getElementById("download-conflict-msg");
+  const conflictSuggested = document.getElementById("dl-conflict-suggested");
+  const conflictProceed = document.getElementById("dl-conflict-proceed");
+  const conflictCancel = document.getElementById("dl-conflict-cancel");
+  const dock = document.getElementById("download-dock");
+  const dockList = document.getElementById("download-dock-list");
+  /** @type {Record<string, true>} */
+  const localReadyFired = {};
+  let downloadPollTimer = null;
+
+  function setModalBusy(busy, text) {
+    if (desktopBtn) desktopBtn.disabled = busy;
+    if (localBtn) localBtn.disabled = busy;
+    if (conflictProceed) conflictProceed.disabled = busy;
+    if (conflictCancel) conflictCancel.disabled = busy;
+    if (modalStatus) {
+      if (text) {
+        modalStatus.hidden = false;
+        modalStatus.textContent = text;
+      } else if (!busy) {
+        modalStatus.hidden = true;
+        modalStatus.textContent = "";
+      }
+    }
+  }
+
+  function showConflictPrompt(info) {
+    const names = (info.conflicts || []).map((c) => `“${c.name}”`).join(", ");
+    const kind = (info.conflicts || []).some((c) => c.kind === "folder")
+      ? "file/folder"
+      : "file";
+    const title = modal?.querySelector("h2");
+    if (title) title.textContent = "Already on your PC";
+    if (conflictMsg) {
+      conflictMsg.textContent =
+        `${names || "This item"} already exists in your PC folder. ` +
+        `Download anyway as a copy, or keep the existing ${kind}?`;
+    }
+    if (conflictSuggested) {
+      conflictSuggested.textContent = info.suggested
+        ? `Would save as “${info.suggested}”`
+        : "Saves as a copy with (1), etc.";
+    }
+    if (downloadChoices) downloadChoices.hidden = true;
+    if (conflictBox) conflictBox.hidden = false;
+  }
+
+  function resetDownloadModalView() {
+    const title = modal?.querySelector("h2");
+    if (title) title.textContent = "Download file";
+    if (downloadChoices) downloadChoices.hidden = false;
+    if (conflictBox) conflictBox.hidden = true;
+  }
+
+  function openDownloadModal(channel, messageId, fileName) {
+    pendingDownload = { channel, messageId: Number(messageId), fileName };
+    if (modalName) {
+      modalName.textContent = fileName || `@${channel}/${messageId}`;
+    }
+    resetDownloadModalView();
+    setModalBusy(false, "");
+    modal?.showModal();
+  }
+
+  function renderDock(jobs) {
+    if (!dock || !dockList) return;
+    const visible = jobs || [];
+    if (!visible.length) {
+      dock.hidden = true;
+      dockList.innerHTML = "";
+      return;
+    }
+    dock.hidden = false;
+    dockList.innerHTML = visible
+      .map((j) => {
+        const pct = Math.max(0, Math.min(100, Number(j.progress) || 0));
+        const status = j.status || "";
+        const mode = j.mode === "local" ? "this device" : "PC folder";
+        const canCancel =
+          status === "queued" || status === "running" || status === "needs_confirm";
+        let detail = status;
+        let actions = "";
+        if (status === "queued") detail = "Queued";
+        else if (status === "needs_confirm") {
+          const c = j.conflict || {};
+          const existing = c.name || "item";
+          const suggested = c.suggested || `${existing} (1)`;
+          detail = `“${existing}” already exists`;
+          actions = `<div class="download-conflict-actions">
+            <button type="button" class="btn btn-sm" data-resolve-job="${escapeHtml(j.id)}" data-proceed="1">Download as “${escapeHtml(suggested)}”</button>
+            <button type="button" class="btn secondary btn-sm" data-resolve-job="${escapeHtml(j.id)}" data-proceed="0">Keep existing</button>
+          </div>`;
+        } else if (status === "running") {
+          if (j.extracting) {
+            detail = "Extracting…";
+          } else {
+            const rec = formatBytes(j.received);
+            const tot = formatBytes(j.total);
+            detail = tot ? `${pct}% · ${rec} / ${tot}` : `${pct}%`;
+          }
+        } else if (status === "done") {
+          if (j.mode === "local") detail = "Ready — saving…";
+          else if (j.extracted) detail = j.extract_note || "Extracted on PC";
+          else if (j.extract_note) detail = j.extract_note;
+          else detail = "Saved to PC";
+        } else if (status === "cancelled") {
+          detail = "Cancelled";
+        } else if (status === "error") {
+          detail = j.error || "Failed";
+        }
+        const cancelBtn = canCancel
+          ? `<button type="button" class="download-cancel-btn" data-cancel-job="${escapeHtml(j.id)}" title="Cancel">×</button>`
+          : "";
+        const barHidden = status === "needs_confirm" ? " hidden" : "";
+        return `<div class="download-job status-${escapeHtml(status)}">
+          <div class="download-job-top">
+            <span class="download-job-name" title="${escapeHtml(j.filename || "")}">${escapeHtml(j.filename || j.id)}</span>
+            <span class="download-job-actions">
+              <span class="download-job-mode">${mode}</span>
+              ${cancelBtn}
+            </span>
+          </div>
+          <div class="download-job-bar"${barHidden}><div style="width:${pct}%"></div></div>
+          <div class="download-job-meta">${escapeHtml(detail)}</div>
+          ${actions}
+        </div>`;
+      })
+      .join("");
+
+    for (const j of visible) {
+      if (j.mode === "local" && j.status === "done" && j.id && !localReadyFired[j.id]) {
+        localReadyFired[j.id] = true;
+        const a = document.createElement("a");
+        a.href = `/download/job/${encodeURIComponent(j.id)}`;
+        a.download = j.filename || "download";
+        a.style.display = "none";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      }
+    }
+  }
+
+  async function cancelDownload(jobId) {
+    try {
+      await fetch("/api/download/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ job_id: jobId }),
+      });
+      if (downloadPollTimer) window.clearTimeout(downloadPollTimer);
+      pollDownloads();
+    } catch (e) {}
+  }
+
+  async function resolveConflict(jobId, proceed) {
+    try {
+      await fetch("/api/download/resolve-conflict", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ job_id: jobId, proceed: !!proceed }),
+      });
+      if (downloadPollTimer) window.clearTimeout(downloadPollTimer);
+      pollDownloads();
+    } catch (e) {}
+  }
+
+  async function pollDownloads() {
+    try {
+      const res = await fetch("/api/download/queue");
+      const data = await res.json();
+      renderDock(data.jobs || []);
+      const active = (data.jobs || []).some(
+        (j) =>
+          j.status === "queued" ||
+          j.status === "running" ||
+          j.status === "needs_confirm"
+      );
+      if (active) {
+        downloadPollTimer = window.setTimeout(pollDownloads, 500);
+      } else {
+        downloadPollTimer = window.setTimeout(pollDownloads, 2500);
+      }
+    } catch (e) {
+      downloadPollTimer = window.setTimeout(pollDownloads, 3000);
+    }
+  }
+
+  async function queueDownload(mode, allowDuplicate = false) {
+    if (!pendingDownload) return;
+    setModalBusy(true, "Adding to queue…");
+    try {
+      const res = await fetch("/api/download/queue", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({
+          channel: pendingDownload.channel,
+          message_id: pendingDownload.messageId,
+          filename: pendingDownload.fileName || "",
+          mode,
+          allow_duplicate: !!allowDuplicate,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error || "Could not queue");
+      modal?.close();
+      resetDownloadModalView();
+      setModalBusy(false, "");
+      if (downloadPollTimer) window.clearTimeout(downloadPollTimer);
+      pollDownloads();
+    } catch (e) {
+      setModalBusy(false, e.message || "Queue failed");
+    }
+  }
+
+  async function startDesktopDownload() {
+    if (!pendingDownload) return;
+    setModalBusy(true, "Checking PC folder…");
+    try {
+      const res = await fetch("/api/download/check", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({
+          channel: pendingDownload.channel,
+          message_id: pendingDownload.messageId,
+          filename: pendingDownload.fileName || "",
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error || "Check failed");
+      if (data.filename) pendingDownload.fileName = data.filename;
+      if (data.has_conflict) {
+        setModalBusy(false, "");
+        showConflictPrompt(data);
+        return;
+      }
+      await queueDownload("desktop", false);
+    } catch (e) {
+      setModalBusy(false, e.message || "Check failed");
+    }
+  }
+
+  document.getElementById("results")?.addEventListener("click", (ev) => {
+    const btn = ev.target.closest(".btn-download");
+    if (!btn) return;
+    openDownloadModal(
+      btn.dataset.channel,
+      btn.dataset.messageId,
+      btn.dataset.fileName
+    );
+  });
+
+  desktopBtn?.addEventListener("click", () => startDesktopDownload());
+  localBtn?.addEventListener("click", () => queueDownload("local", false));
+  conflictProceed?.addEventListener("click", () => queueDownload("desktop", true));
+  conflictCancel?.addEventListener("click", () => {
+    modal?.close();
+    resetDownloadModalView();
+    setModalBusy(false, "");
+  });
+
+  document.getElementById("download-dock-clear")?.addEventListener("click", async () => {
+    try {
+      const res = await fetch("/api/download/clear", { method: "POST" });
+      const data = await res.json();
+      renderDock(data.jobs || []);
+    } catch (e) {}
+  });
+
+  dockList?.addEventListener("click", (ev) => {
+    const resolveBtn = ev.target.closest("[data-resolve-job]");
+    if (resolveBtn) {
+      resolveConflict(
+        resolveBtn.getAttribute("data-resolve-job"),
+        resolveBtn.getAttribute("data-proceed") === "1"
+      );
+      return;
+    }
+    const btn = ev.target.closest("[data-cancel-job]");
+    if (!btn) return;
+    cancelDownload(btn.getAttribute("data-cancel-job"));
+  });
+
+  pollDownloads();
+</script>
+{% endblock %}

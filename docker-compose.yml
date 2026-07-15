@@ -1,0 +1,27 @@
+# STL Search on Synology — edit paths/passwords before first run.
+#
+# On the NAS, put this file next to Dockerfile, requirements.txt, app/, run.py, channels.txt
+# and a .env file (see SYNOLOGY_SETUP.txt).
+
+services:
+  stl-search:
+    build: .
+    container_name: stl-search
+    restart: unless-stopped
+    ports:
+      # NAS_LAN_IP:8787 → open in browser on your home network
+      - "8787:8787"
+    env_file:
+      - .env
+    environment:
+      STL_HOST: "0.0.0.0"
+      STL_PORT: "8787"
+      # Where "Save to PC folder" writes INSIDE the container
+      STL_DOWNLOAD_DIR: "/downloads"
+    volumes:
+      # Keep Telegram login + channel lists + download history
+      - ./data:/app/data
+      # Your STL download destination on the NAS (CHANGE THIS PATH)
+      - /volume1/docker/stl-search/downloads:/downloads
+    # Optional: give container a stable hostname on your LAN
+    # hostname: stl-search

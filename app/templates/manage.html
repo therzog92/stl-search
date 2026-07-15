@@ -1,0 +1,516 @@
+{% extends "base.html" %}
+{% block title %}Manage channels · STL Search{% endblock %}
+{% block body %}
+<div class="shell">
+  <header class="brand">
+    <div>
+      <h1>Manage channels</h1>
+      <p>
+        Choose which channels to search. Changes save automatically.
+        Star favorites to browse them from Home. Invalid usernames are removed automatically.
+      </p>
+    </div>
+  </header>
+
+  {% if message %}
+  <div class="panel" style="margin-bottom: 1rem; border-color: rgba(216, 255, 62, 0.35)">
+    <p class="hint" style="margin: 0; color: var(--ink)">{{ message }}</p>
+  </div>
+  {% endif %}
+  {% if error %}
+  <div class="error" style="margin-bottom: 1rem">{{ error }}</div>
+  {% endif %}
+
+  <section class="panel">
+    <h2>Add a channel</h2>
+    <form method="post" action="/manage/add" class="add-channel-form">
+      <label for="username">Username or t.me link</label>
+      <div class="add-row">
+        <input
+          id="username"
+          name="username"
+          type="text"
+          placeholder="@channelname or https://t.me/channelname"
+          required
+        />
+        <button class="btn" type="submit">Add channel</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="matches-header">
+      <div>
+        <h2>Your channel list</h2>
+        <p class="hint" style="margin: 0.25rem 0 0">
+          <span id="list-stats">
+            {{ enabled_count }} of {{ channels|length }} enabled ·
+            {{ favorite_count }} favorite{{ "s" if favorite_count != 1 else "" }}
+          </span>
+          {% if incomplete_count %}
+          · <span id="incomplete-hint">{{ incomplete_count }} missing members/description</span>
+          {% endif %}
+          <span id="save-status" class="save-status" aria-live="polite"></span>
+        </p>
+        {% if enrich_running %}
+        <p class="hint" id="enrich-progress" style="margin: 0.35rem 0 0; color: var(--ink)">
+          {{ enrich_progress or "Fetching details…" }}
+        </p>
+        {% else %}
+        <p class="hint" id="enrich-progress" style="margin: 0.35rem 0 0" hidden></p>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="manage-toolbar">
+      <form method="post" action="/manage/enrich" class="inline-form">
+        <button
+          class="btn secondary"
+          type="submit"
+          id="enrich-btn"
+          {% if enrich_running %}disabled{% endif %}
+        >
+          {% if enrich_running %}Fetching details…{% else %}Load members &amp; descriptions{% endif %}
+        </button>
+      </form>
+
+      <div class="manage-select-tools">
+        <button type="button" class="btn secondary" id="select-none">Deselect all</button>
+        <button type="button" class="btn secondary" id="select-all">Select all</button>
+        <label class="threshold-label" for="member-threshold">
+          Select ≥
+          <input
+            type="number"
+            id="member-threshold"
+            min="0"
+            step="100"
+            value="{{ min_members }}"
+          />
+          members
+        </label>
+        <button type="button" class="btn" id="select-above">Select above threshold</button>
+      </div>
+    </div>
+
+    <div id="manage-form">
+      <div class="manage-table-wrap">
+        <table class="manage-table">
+          <thead>
+            <tr>
+              <th class="col-check">Use</th>
+              <th class="col-check">★</th>
+              <th>Username</th>
+              <th>Name</th>
+              <th>Members</th>
+              <th>Source</th>
+              <th>Description</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="channel-tbody">
+            {% for c in channels %}
+            <tr
+              class="{% if not c.included %}row-off{% endif %}{% if c.favorite %} row-fav{% endif %}"
+              data-members="{{ c.members or 0 }}"
+              data-username="{{ c.username }}"
+            >
+              <td class="col-check">
+                <input
+                  type="checkbox"
+                  name="enabled"
+                  value="{{ c.username }}"
+                  {% if c.included %}checked{% endif %}
+                />
+              </td>
+              <td class="col-check">
+                <input
+                  type="checkbox"
+                  class="fav-check"
+                  name="favorite"
+                  value="{{ c.username }}"
+                  {% if c.favorite %}checked{% endif %}
+                  title="Favorite"
+                />
+              </td>
+              <td>
+                <a href="{{ c.link }}" target="_blank" rel="noopener">@{{ c.username }}</a>
+              </td>
+              <td>{{ c.title }}</td>
+              <td class="col-members">
+                {% if c.members %}{{ "{:,}".format(c.members) }}{% else %}
+                <span class="muted">—</span>{% endif %}
+              </td>
+              <td><span class="pill">{{ c.source }}</span></td>
+              <td class="col-desc" title="{{ c.description }}">
+                {% if c.description %}
+                  {{ c.description[:140] }}{% if c.description|length > 140 %}…{% endif %}
+                {% else %}
+                  <span class="muted">—</span>
+                {% endif %}
+              </td>
+              <td>
+                <div class="row-actions">
+                  <a class="btn secondary btn-sm" href="/channel/{{ c.username }}">Browse</a>
+                  <button
+                    class="btn secondary btn-sm btn-ban"
+                    type="button"
+                    data-ban="{{ c.username }}"
+                    title="Ban / remove from list"
+                  >Ban</button>
+                </div>
+              </td>
+            </tr>
+            {% else %}
+            <tr id="empty-channels-row">
+              <td colspan="8" class="hint">No channels yet.</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div style="margin-top: 1rem; display: flex; gap: 0.75rem; flex-wrap: wrap">
+        <form method="post" action="/manage/purge" class="inline-form">
+          <button class="btn secondary" type="submit">Remove invalid leftovers</button>
+        </form>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" id="blacklist">
+    <h2>Blacklist</h2>
+    <p class="hint" style="margin-top: -0.35rem; margin-bottom: 1rem">
+      Banned channels stay here so they are not re-added by Discover / Deep crawl.
+      They are hidden from the home page and skipped during search.
+    </p>
+    {% if blacklist %}
+    <div class="manage-table-wrap">
+      <table class="manage-table">
+        <thead>
+          <tr>
+            <th>Username</th>
+            <th>Name</th>
+            <th>Members</th>
+            <th>Source</th>
+            <th>Description</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="blacklist-tbody">
+          {% for c in blacklist %}
+          <tr class="row-banned" data-username="{{ c.username }}">
+            <td>
+              <a href="{{ c.link }}" target="_blank" rel="noopener">@{{ c.username }}</a>
+            </td>
+            <td>{{ c.title }}</td>
+            <td>
+              {% if c.members %}{{ "{:,}".format(c.members) }}{% else %}
+              <span class="muted">—</span>{% endif %}
+            </td>
+            <td><span class="pill">{{ c.source }}</span></td>
+            <td class="col-desc" title="{{ c.description }}">
+              {% if c.description %}
+                {{ c.description[:140] }}{% if c.description|length > 140 %}…{% endif %}
+              {% else %}
+                <span class="muted">—</span>
+              {% endif %}
+            </td>
+            <td>
+              <button class="btn btn-sm" type="button" data-unban="{{ c.username }}">Restore</button>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <p class="hint" id="blacklist-empty">No blacklisted channels.</p>
+    <div class="manage-table-wrap" id="blacklist-table-wrap" hidden>
+      <table class="manage-table">
+        <thead>
+          <tr>
+            <th>Username</th>
+            <th>Name</th>
+            <th>Members</th>
+            <th>Source</th>
+            <th>Description</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="blacklist-tbody"></tbody>
+      </table>
+    </div>
+    {% endif %}
+  </section>
+</div>
+<script>
+  const enabledBoxes = () =>
+    document.querySelectorAll('#manage-form input[name="enabled"]');
+  const favoriteBoxes = () =>
+    document.querySelectorAll('#manage-form input[name="favorite"]');
+  const saveStatus = document.getElementById("save-status");
+  let saveTimer = null;
+  let saving = false;
+
+  function setStatus(text) {
+    if (saveStatus) saveStatus.textContent = text ? ` · ${text}` : "";
+  }
+
+  function updateRowState(row) {
+    if (!row) return;
+    const enabled = row.querySelector('input[name="enabled"]')?.checked;
+    const fav = row.querySelector('input[name="favorite"]')?.checked;
+    row.classList.toggle("row-off", !enabled);
+    row.classList.toggle("row-fav", !!fav);
+  }
+
+  function updateStats(data) {
+    const el = document.getElementById("list-stats");
+    if (!el || !data) return;
+    const favLabel = data.favorite_count === 1 ? "favorite" : "favorites";
+    el.textContent = `${data.enabled_count} of ${data.total} enabled · ${data.favorite_count} ${favLabel}`;
+  }
+
+  async function autoSave() {
+    saving = true;
+    setStatus("Saving…");
+    const body = new FormData();
+    body.set("ajax", "1");
+    enabledBoxes().forEach((cb) => {
+      if (cb.checked) body.append("enabled", cb.value);
+    });
+    favoriteBoxes().forEach((cb) => {
+      if (cb.checked) body.append("favorite", cb.value);
+    });
+    try {
+      const res = await fetch("/manage/save", {
+        method: "POST",
+        body,
+        headers: { Accept: "application/json" },
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error("save failed");
+      updateStats(data);
+      setStatus("Saved");
+      window.clearTimeout(saveTimer);
+      saveTimer = window.setTimeout(() => setStatus(""), 1200);
+    } catch (e) {
+      setStatus("Save failed");
+    } finally {
+      saving = false;
+    }
+  }
+
+  function scheduleSave() {
+    window.clearTimeout(saveTimer);
+    saveTimer = window.setTimeout(autoSave, 120);
+  }
+
+  document.getElementById("manage-form")?.addEventListener("change", (ev) => {
+    const t = ev.target;
+    if (!(t instanceof HTMLInputElement)) return;
+    if (t.name !== "enabled" && t.name !== "favorite") return;
+    updateRowState(t.closest("tr"));
+    scheduleSave();
+  });
+
+  document.getElementById("select-all")?.addEventListener("click", () => {
+    enabledBoxes().forEach((cb) => {
+      cb.checked = true;
+      updateRowState(cb.closest("tr"));
+    });
+    autoSave();
+  });
+
+  document.getElementById("select-none")?.addEventListener("click", () => {
+    enabledBoxes().forEach((cb) => {
+      cb.checked = false;
+      updateRowState(cb.closest("tr"));
+    });
+    autoSave();
+  });
+
+  document.getElementById("select-above")?.addEventListener("click", () => {
+    const input = document.getElementById("member-threshold");
+    const threshold = Number(input?.value || 0);
+    enabledBoxes().forEach((cb) => {
+      const row = cb.closest("tr");
+      const members = Number(row?.dataset.members || 0);
+      cb.checked = members >= threshold;
+      updateRowState(row);
+    });
+    autoSave();
+  });
+
+  function ensureBlacklistTable() {
+    let tbody = document.getElementById("blacklist-tbody");
+    if (tbody) {
+      const empty = document.getElementById("blacklist-empty");
+      const wrap = document.getElementById("blacklist-table-wrap");
+      if (empty) empty.hidden = true;
+      if (wrap) wrap.hidden = false;
+      return tbody;
+    }
+    return null;
+  }
+
+  async function banChannel(username, btn) {
+    const row = btn.closest("tr");
+    const body = new FormData();
+    body.set("username", username);
+    btn.disabled = true;
+    try {
+      const res = await fetch("/manage/ban", {
+        method: "POST",
+        body,
+        headers: { Accept: "application/json" },
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error || "ban failed");
+
+      const title = data.title || username;
+      const membersHtml = data.members
+        ? Number(data.members).toLocaleString()
+        : '<span class="muted">—</span>';
+      const desc = (data.description || "").trim();
+      const descHtml = desc
+        ? `${desc.slice(0, 140)}${desc.length > 140 ? "…" : ""}`
+        : '<span class="muted">—</span>';
+      const link = data.link || `https://t.me/${username}`;
+      const source = data.source || "";
+
+      row?.remove();
+      const tbody = ensureBlacklistTable();
+      if (tbody) {
+        const tr = document.createElement("tr");
+        tr.className = "row-banned";
+        tr.dataset.username = username;
+        tr.innerHTML = `
+          <td><a href="${link}" target="_blank" rel="noopener">@${username}</a></td>
+          <td></td>
+          <td>${membersHtml}</td>
+          <td><span class="pill"></span></td>
+          <td class="col-desc"></td>
+          <td><button class="btn btn-sm" type="button" data-unban="${username}">Restore</button></td>`;
+        tr.children[1].textContent = title;
+        tr.querySelector(".pill").textContent = source;
+        tr.querySelector(".col-desc").innerHTML = descHtml;
+        tr.querySelector(".col-desc").title = desc;
+        tbody.appendChild(tr);
+      }
+      updateStats(data);
+      setStatus("Banned");
+      window.setTimeout(() => setStatus(""), 1200);
+    } catch (e) {
+      btn.disabled = false;
+      setStatus("Ban failed");
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;");
+  }
+
+  async function unbanChannel(username, btn) {
+    const row = btn.closest("tr");
+    const body = new FormData();
+    body.set("username", username);
+    btn.disabled = true;
+    try {
+      const res = await fetch("/manage/unban", {
+        method: "POST",
+        body,
+        headers: { Accept: "application/json" },
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error || "unban failed");
+
+      row?.remove();
+      const channelBody = document.getElementById("channel-tbody");
+      document.getElementById("empty-channels-row")?.remove();
+      if (channelBody) {
+        const membersHtml = data.members
+          ? Number(data.members).toLocaleString()
+          : '<span class="muted">—</span>';
+        const desc = (data.description || "").trim();
+        const descHtml = desc
+          ? `${escapeHtml(desc.slice(0, 140))}${desc.length > 140 ? "…" : ""}`
+          : '<span class="muted">—</span>';
+        const tr = document.createElement("tr");
+        tr.dataset.members = String(data.members || 0);
+        tr.dataset.username = username;
+        if (!data.included) tr.classList.add("row-off");
+        if (data.favorite) tr.classList.add("row-fav");
+        tr.innerHTML = `
+          <td class="col-check"><input type="checkbox" name="enabled" value="${escapeHtml(username)}" ${data.included ? "checked" : ""} /></td>
+          <td class="col-check"><input type="checkbox" class="fav-check" name="favorite" value="${escapeHtml(username)}" ${data.favorite ? "checked" : ""} title="Favorite" /></td>
+          <td><a href="${escapeHtml(data.link || `https://t.me/${username}`)}" target="_blank" rel="noopener">@${escapeHtml(username)}</a></td>
+          <td></td>
+          <td class="col-members">${membersHtml}</td>
+          <td><span class="pill"></span></td>
+          <td class="col-desc"></td>
+          <td>
+            <div class="row-actions">
+              <a class="btn secondary btn-sm" href="/channel/${encodeURIComponent(username)}">Browse</a>
+              <button class="btn secondary btn-sm btn-ban" type="button" data-ban="${escapeHtml(username)}" title="Ban / remove from list">Ban</button>
+            </div>
+          </td>`;
+        tr.children[3].textContent = data.title || username;
+        tr.querySelector(".pill").textContent = data.source || "";
+        const descEl = tr.querySelector(".col-desc");
+        descEl.innerHTML = descHtml;
+        descEl.title = desc;
+        channelBody.prepend(tr);
+      }
+      const blBody = document.getElementById("blacklist-tbody");
+      if (blBody && !blBody.children.length) {
+        const empty = document.getElementById("blacklist-empty");
+        const wrap = document.getElementById("blacklist-table-wrap");
+        if (empty) empty.hidden = false;
+        if (wrap) wrap.hidden = true;
+      }
+      await autoSave();
+      setStatus("Restored");
+      window.setTimeout(() => setStatus(""), 1200);
+    } catch (e) {
+      btn.disabled = false;
+      setStatus("Restore failed");
+    }
+  }
+
+  document.getElementById("channel-tbody")?.addEventListener("click", (ev) => {
+    const btn = ev.target.closest("[data-ban]");
+    if (!btn) return;
+    banChannel(btn.getAttribute("data-ban"), btn);
+  });
+
+  document.getElementById("blacklist")?.addEventListener("click", (ev) => {
+    const btn = ev.target.closest("[data-unban]");
+    if (!btn) return;
+    unbanChannel(btn.getAttribute("data-unban"), btn);
+  });
+
+  {% if enrich_running %}
+  (async function pollEnrich() {
+    try {
+      const res = await fetch("/api/discovery");
+      const data = await res.json();
+      const el = document.getElementById("enrich-progress");
+      if (el && data.progress) {
+        el.hidden = false;
+        el.textContent = data.progress;
+        el.style.color = "var(--ink)";
+      }
+      if (!data.running) {
+        window.location.href = "/manage";
+        return;
+      }
+    } catch (e) {}
+    setTimeout(pollEnrich, 1500);
+  })();
+  {% endif %}
+</script>
+{% endblock %}

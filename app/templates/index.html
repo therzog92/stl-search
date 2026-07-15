@@ -1,0 +1,315 @@
+{% extends "base.html" %}
+{% block title %}STL Search{% endblock %}
+{% block body %}
+<div class="shell">
+  <header class="brand">
+    <div>
+      <h1>STL Search</h1>
+      <p>
+        Search your curated Telegram channels for models, previews, and file posts —
+        one query across all of them.
+      </p>
+    </div>
+    <div class="channel-tools" role="group" aria-label="Channel tools">
+      <form method="post" action="/channels/discover">
+        <button class="btn secondary btn-sm" type="submit" {% if not telemetr_configured %}title="Add TELEMETR_API_KEY to .env first"{% endif %}>
+          Discover
+        </button>
+      </form>
+      <form method="post" action="/channels/deep-crawl">
+        <button class="btn secondary btn-sm" type="submit">Deep crawl</button>
+      </form>
+      <form method="post" action="/channels/refresh">
+        <button class="btn secondary btn-sm" type="submit">Refresh list</button>
+      </form>
+    </div>
+  </header>
+
+  {% if discovery_running %}
+  <div class="panel" style="margin-bottom: 1rem" id="discovery-banner">
+    <p class="hint" style="margin: 0; color: var(--ink)">
+      Discovery running: <strong id="discovery-progress">{{ discovery_progress or "…" }}</strong>
+      — this page stays usable; channel list updates when finished.
+    </p>
+  </div>
+  {% endif %}
+
+  {% if discovery_error %}
+  <div class="error" style="margin-bottom: 1rem">{{ discovery_error }}</div>
+  {% endif %}
+  {% if discovery_message %}
+  <div class="panel" style="margin-bottom: 1rem; border-color: rgba(216, 255, 62, 0.35)">
+    <p class="hint" style="margin: 0; color: var(--ink)">{{ discovery_message }}</p>
+  </div>
+  {% endif %}
+
+  {% if not telemetr_configured %}
+  <div class="error" style="margin-bottom: 1rem">
+    Telemetr catalog key not set. Message
+    <a href="https://t.me/telemetrio_api_bot" target="_blank" rel="noopener">@telemetrio_api_bot</a>
+    → <code>/api_key</code>, then put
+    <code>TELEMETR_API_KEY=...</code> in
+    <code>.env</code> and restart. Discover uses this index (seconds, not minutes).
+  </div>
+  {% endif %}
+
+  <section class="panel">
+    <h2>Search</h2>
+    <form method="post" action="/search" id="search-form">
+      <div class="search-fields">
+        <div>
+          <label for="query">Search terms (OR)</label>
+          <textarea
+            id="query"
+            name="query"
+            rows="3"
+            placeholder="creator name | model keyword | another term"
+            required
+            autofocus
+          ></textarea>
+        </div>
+        <div class="search-side">
+          <div>
+            <label for="max_age_days">Max age (days)</label>
+            <input
+              id="max_age_days"
+              name="max_age_days"
+              type="number"
+              min="1"
+              max="3650"
+              value="{{ max_age_days }}"
+            />
+          </div>
+          <button class="btn" type="submit" id="search-btn">Search channels</button>
+        </div>
+      </div>
+
+      <label class="toggle">
+        <input type="checkbox" name="files_only" value="on" checked />
+        <span>Only STL / 3MF / ZIP (and RAR / 7Z) file posts</span>
+      </label>
+      <p class="hint">
+        Separate terms with <code>|</code> or <code>OR</code> (or new lines) to search all in one run.
+        Each term still expands variants (spaces / hyphens / glued). More terms = longer search.
+        Member floor: {{ "{:,}".format(min_members) }}.
+      </p>
+    </form>
+  </section>
+
+  <section class="panel">
+    <h2>Your seed channels</h2>
+    <div class="channel-grid">
+      {% for c in seed_channels %}
+      <article class="channel {% if not c.included %}excluded{% endif %}" data-username="{{ c.username }}">
+        <div class="channel-head">
+          <div class="title">{{ c.title }}</div>
+          <button
+            type="button"
+            class="star-btn {% if c.favorite %}is-fav{% endif %}"
+            data-username="{{ c.username }}"
+            aria-label="{% if c.favorite %}Remove from favorites{% else %}Add to favorites{% endif %}"
+            aria-pressed="{{ 'true' if c.favorite else 'false' }}"
+            title="{% if c.favorite %}Favorited{% else %}Add to favorites{% endif %}"
+          ></button>
+        </div>
+        <div class="meta">
+          <a href="{{ c.link }}" target="_blank" rel="noopener">@{{ c.username }}</a>
+          ·
+          {% if c.members %}{{ "{:,}".format(c.members) }} members{% else %}members pending — click Refresh list{% endif %}
+        </div>
+        <span class="badge {% if c.included %}ok{% else %}skip{% endif %}">
+          {% if c.included %}included{% else %}skipped{% endif %}
+        </span>
+        {% if c.reason and c.reason != "OK" and not c.reason.startswith("OK") %}
+        <div class="meta" style="margin-top: 0.35rem">{{ c.reason }}</div>
+        {% endif %}
+      </article>
+      {% else %}
+      <p class="hint">No seed channels in channels.txt</p>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Discovered &amp; related channels</h2>
+    <p class="hint" style="margin-top: -0.35rem; margin-bottom: 1rem">
+      Valid channels only (invalid usernames are dropped). Toggle search use on
+      <a href="/manage">Manage channels</a>.
+      Member counts fill on <strong>Refresh list</strong> / <strong>Discover</strong>.
+    </p>
+    <div class="channel-grid">
+      {% for c in other_channels if c.valid and c.included %}
+      <article class="channel" data-username="{{ c.username }}">
+        <div class="channel-head">
+          <div class="title">{{ c.title }}</div>
+          <button
+            type="button"
+            class="star-btn {% if c.favorite %}is-fav{% endif %}"
+            data-username="{{ c.username }}"
+            aria-label="{% if c.favorite %}Remove from favorites{% else %}Add to favorites{% endif %}"
+            aria-pressed="{{ 'true' if c.favorite else 'false' }}"
+            title="{% if c.favorite %}Favorited{% else %}Add to favorites{% endif %}"
+          ></button>
+        </div>
+        <div class="meta">
+          <a href="{{ c.link }}" target="_blank" rel="noopener">@{{ c.username }}</a>
+          ·
+          {% if c.members %}{{ "{:,}".format(c.members) }} members{% else %}members pending{% endif %}
+        </div>
+        <span class="badge ok">{{ c.source }} · enabled</span>
+        {% if c.reason and c.reason != "OK" %}
+        <div class="meta" style="margin-top: 0.35rem">{{ c.reason }}</div>
+        {% endif %}
+      </article>
+      {% else %}
+      <p class="hint">
+        None enabled yet. Use Discover / Deep crawl, then pick channels on
+        <a href="/manage">Manage channels</a>.
+      </p>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="panel" id="favorites">
+    <h2>★ Favorites</h2>
+    <p class="hint" style="margin-top: -0.35rem; margin-bottom: 1rem">
+      Star any channel above (or here) to pin it for quick browsing.
+    </p>
+    <div class="channel-grid fav-grid" id="favorites-grid">
+      {% for c in favorite_channels %}
+      <article class="channel fav-channel" data-username="{{ c.username }}">
+        <div class="channel-head">
+          <div class="title">{{ c.title }}</div>
+          <button
+            type="button"
+            class="star-btn is-fav"
+            data-username="{{ c.username }}"
+            aria-label="Remove from favorites"
+            aria-pressed="true"
+            title="Favorited"
+          ></button>
+        </div>
+        <div class="meta">
+          <a href="{{ c.link }}" target="_blank" rel="noopener">@{{ c.username }}</a>
+          ·
+          {% if c.members %}{{ "{:,}".format(c.members) }} members{% else %}members unknown{% endif %}
+        </div>
+        {% if c.description %}
+        <div class="meta fav-desc">{{ c.description[:120] }}{% if c.description|length > 120 %}…{% endif %}</div>
+        {% endif %}
+        <div class="fav-actions">
+          <a class="btn" href="/channel/{{ c.username }}">Browse files</a>
+        </div>
+      </article>
+      {% endfor %}
+    </div>
+    <p class="hint" id="favorites-empty" {% if favorite_channels %}hidden{% endif %}>
+      No favorites yet. Click the star on a channel to add it.
+    </p>
+  </section>
+</div>
+<script>
+  document.getElementById("search-form").addEventListener("submit", () => {
+    const btn = document.getElementById("search-btn");
+    btn.disabled = true;
+    btn.textContent = "Starting…";
+  });
+
+  function escapeHtml(s) {
+    return String(s)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;");
+  }
+
+  function syncStarButtons(username, favorite) {
+    document.querySelectorAll(`.star-btn[data-username="${CSS.escape(username)}"]`).forEach((btn) => {
+      btn.classList.toggle("is-fav", favorite);
+      btn.setAttribute("aria-pressed", favorite ? "true" : "false");
+      btn.setAttribute(
+        "aria-label",
+        favorite ? "Remove from favorites" : "Add to favorites"
+      );
+      btn.title = favorite ? "Favorited" : "Add to favorites";
+    });
+  }
+
+  function upsertFavoritesCard(data) {
+    const grid = document.getElementById("favorites-grid");
+    const empty = document.getElementById("favorites-empty");
+    if (!grid) return;
+    const existing = grid.querySelector(`[data-username="${CSS.escape(data.username)}"]`);
+    if (!data.favorite) {
+      existing?.remove();
+      if (!grid.querySelector(".fav-channel") && empty) empty.hidden = false;
+      return;
+    }
+    if (empty) empty.hidden = true;
+    if (existing) return;
+    const members = "";
+    const card = document.createElement("article");
+    card.className = "channel fav-channel";
+    card.dataset.username = data.username;
+    card.innerHTML = `
+      <div class="channel-head">
+        <div class="title">${escapeHtml(data.title || data.username)}</div>
+        <button
+          type="button"
+          class="star-btn is-fav"
+          data-username="${escapeHtml(data.username)}"
+          aria-label="Remove from favorites"
+          aria-pressed="true"
+          title="Favorited"
+        ></button>
+      </div>
+      <div class="meta">
+        <a href="https://t.me/${escapeHtml(data.username)}" target="_blank" rel="noopener">@${escapeHtml(data.username)}</a>
+      </div>
+      <div class="fav-actions">
+        <a class="btn" href="/channel/${escapeHtml(data.username)}">Browse files</a>
+      </div>`;
+    grid.prepend(card);
+  }
+
+  document.addEventListener("click", async (ev) => {
+    const btn = ev.target.closest(".star-btn");
+    if (!btn) return;
+    const username = btn.dataset.username;
+    if (!username || btn.disabled) return;
+    const want = !btn.classList.contains("is-fav");
+    btn.disabled = true;
+    try {
+      const res = await fetch("/api/favorite", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ username, favorite: want }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error || "Could not update favorite");
+      syncStarButtons(data.username, !!data.favorite);
+      upsertFavoritesCard(data);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  {% if discovery_running %}
+  (async function pollDiscovery() {
+    try {
+      const res = await fetch("/api/discovery");
+      const data = await res.json();
+      const el = document.getElementById("discovery-progress");
+      if (el && data.progress) el.textContent = data.progress;
+      if (!data.running) {
+        window.location.reload();
+        return;
+      }
+    } catch (e) {}
+    setTimeout(pollDiscovery, 1500);
+  })();
+  {% endif %}
+</script>
+{% endblock %}

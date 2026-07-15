@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+data/
+*.session
+*.session-journal
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.DS_Store
+SYNOLOGY_SETUP.txt
+# Keep personal channel list local; repo ships channels.example.txt
+channels.txt
+*.tgdlpart

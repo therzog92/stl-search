@@ -1,0 +1,90 @@
+# STL Search (Docker)
+
+Small FastAPI + Telethon app to search Telegram STL/3D channels, browse favorites,
+and download/extract files to a folder on your Synology (or any Docker host).
+
+**This public repo does not contain API keys, `.env`, or Telegram session files.**
+
+---
+
+## Synology — super simple install (Marius-style)
+
+### Requirements
+- Synology with **Container Manager** (Docker)
+- Telegram API ID + Hash from https://my.telegram.org/apps
+
+### Install (2 runs of one command)
+
+**1. SSH into your NAS** (Control Panel → Terminal & SNMP → Enable SSH), then:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/therzog92/stl-search/main/install-synology.sh | bash
+```
+
+**2. First run only creates files.** Edit this file in File Station:
+
+` /volume1/docker/stl-search/.env `
+
+Set:
+
+```env
+TELEGRAM_API_ID=your_id
+TELEGRAM_API_HASH=your_hash
+```
+
+**3. Run the same command again:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/therzog92/stl-search/main/install-synology.sh | bash
+```
+
+**4. Open on your home Wi‑Fi:**
+
+`http://YOUR-NAS-IP:8787`
+
+Log in with Telegram once. Downloads go to:
+
+`/volume1/docker/stl-search/downloads`
+
+### Outside your house (like Jellyfin)
+DSM → **Login Portal / Reverse Proxy** → new rule:
+
+| | |
+|---|---|
+| Source | `https://stl.yourdomain.com` port `443` |
+| Destination | `http://localhost` port `8787` |
+
+Assign your Let's Encrypt certificate to that hostname (same workflow as Jellyfin).
+
+> Do **not** port-forward `8787` to the internet. Use HTTPS reverse proxy (or Tailscale).
+
+---
+
+## Portainer / Dockge (paste stack)
+
+1. Create folders: `/volume1/docker/stl-search/data` and `.../downloads`
+2. Create `/volume1/docker/stl-search/.env` from [`.env.example`](.env.example)
+3. Paste [`docker-compose.synology.yml`](docker-compose.synology.yml) as a stack
+4. Deploy
+
+Image: `ghcr.io/therzog92/stl-search:latest`
+
+If the image pull says denied, make the package **Public** once under  
+GitHub → Packages → `stl-search` → Package settings → Change visibility.
+
+---
+
+## PC / Docker Desktop
+
+```bash
+cp .env.example .env
+# edit .env
+docker compose -f docker-compose.synology.yml up -d
+```
+
+(Edit volume paths for Windows/macOS.)
+
+---
+
+## Security note
+The app stores a Telegram **session** under `/data`. Treat the web UI like access to your Telegram account — keep it behind HTTPS or VPN.

@@ -1,0 +1,9 @@
+*
+!app/
+!app/**
+!requirements.txt
+!run.py
+!channels.example.txt
+!Dockerfile
+!.dockerignore
+!.env.example
