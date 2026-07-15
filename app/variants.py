@@ -67,7 +67,7 @@ def _variants_for_term(q: str) -> list[str]:
     return variants
 
 
-def generate_variants(query: str) -> list[str]:
+def generate_variants(query: str, max_per_term: int | None = None) -> list[str]:
     """
     Expand one or more OR terms into Telegram search strings.
 
@@ -76,6 +76,9 @@ def generate_variants(query: str) -> list[str]:
       "Yosh Studios | gojo | toji | life size"
       one term per line
     """
+    from app.config import SEARCH_MAX_VARIANTS_PER_TERM
+
+    cap = SEARCH_MAX_VARIANTS_PER_TERM if max_per_term is None else max_per_term
     terms = split_or_terms(query)
     if not terms:
         return []
@@ -83,7 +86,7 @@ def generate_variants(query: str) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     for term in terms:
-        for variant in _variants_for_term(term):
+        for variant in _variants_for_term(term)[: max(1, cap)]:
             key = variant.casefold()
             if key not in seen:
                 seen.add(key)

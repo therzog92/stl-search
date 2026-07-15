@@ -14,6 +14,7 @@ CHANNELS_FILE = ROOT / "channels.txt"
 DISCOVERED_FILE = ROOT / "data" / "discovered_channels.json"
 CHANNEL_CACHE_FILE = ROOT / "data" / "channel_cache.json"
 BLACKLIST_FILE = ROOT / "data" / "blacklist.json"
+JOINED_CHANNELS_FILE = ROOT / "data" / "joined_channels.json"
 DOWNLOAD_HISTORY_FILE = ROOT / "data" / "download_history.json"
 DOWNLOAD_INDEX_FILE = ROOT / "data" / "download_index.json"
 THUMBS_DIR = ROOT / "data" / "thumbs"
@@ -36,9 +37,22 @@ DISCOVERY_QUERIES = (
 )
 MIN_CHANNEL_MEMBERS = int(os.getenv("MIN_CHANNEL_MEMBERS", "2500"))
 MAX_AGE_DAYS = int(os.getenv("MAX_AGE_DAYS", "730"))
-SEARCH_DELAY_SECONDS = float(os.getenv("SEARCH_DELAY_SECONDS", "1.2"))
-# How many URL / t.me posts to scan per seed during deep crawl
+# Keep search gentle — Telegram rate-limits the user session (not per channel)
+SEARCH_DELAY_SECONDS = float(os.getenv("SEARCH_DELAY_SECONDS", "0.35"))
+SEARCH_CONCURRENCY = int(os.getenv("SEARCH_CONCURRENCY", "2"))
+SEARCH_VARIANT_DELAY = float(os.getenv("SEARCH_VARIANT_DELAY", "0.2"))
+# Cap spelling variants per OR-term (spaces / hyphens / glued) to cut API calls
+SEARCH_MAX_VARIANTS_PER_TERM = int(os.getenv("SEARCH_MAX_VARIANTS_PER_TERM", "4"))
+# Pause between channel joins (join/mute is heavily rate-limited by Telegram)
+JOIN_DELAY_SECONDS = float(os.getenv("JOIN_DELAY_SECONDS", "5.0"))
+# Wait through FloodWaits up to this long, then pause the job for a later resume
+JOIN_MAX_WAIT_SECONDS = int(os.getenv("JOIN_MAX_WAIT_SECONDS", "300"))
+# How many URL / t.me posts to scan per channel during deep crawl
 LINK_CRAWL_LIMIT = int(os.getenv("LINK_CRAWL_LIMIT", "800"))
+# Max seeds+discovered channels to crawl as roots (largest first after seeds)
+DEEP_CRAWL_MAX_ROOTS = int(os.getenv("DEEP_CRAWL_MAX_ROOTS", "120"))
+# Cap how many NEW candidates get full inspect (stop early still keeps those already accepted)
+DEEP_CRAWL_MAX_INSPECT = int(os.getenv("DEEP_CRAWL_MAX_INSPECT", "250"))
 
 # Telemetr.io catalog API (https://t.me/telemetrio_api_bot → /api_key)
 TELEMETR_API_KEY = os.getenv("TELEMETR_API_KEY", "")

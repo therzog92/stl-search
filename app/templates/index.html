@@ -1,6 +1,8 @@
 {% extends "base.html" %}
 {% block title %}STL Search{% endblock %}
 {% block body %}
+{% set joined_lookup = joined_lookup if joined_lookup is defined else {} %}
+{% set joined_status = joined_status if joined_status is defined else {} %}
 <div class="shell">
   <header class="brand">
     <div>
@@ -17,7 +19,13 @@
         </button>
       </form>
       <form method="post" action="/channels/deep-crawl">
-        <button class="btn secondary btn-sm" type="submit">Deep crawl</button>
+        <button
+          class="btn secondary btn-sm"
+          type="submit"
+          title="Crawl similar channels &amp; t.me links from seeds + discovered (skips crypto)"
+        >
+          Deep crawl
+        </button>
       </form>
       <form method="post" action="/channels/refresh">
         <button class="btn secondary btn-sm" type="submit">Refresh list</button>
@@ -26,11 +34,14 @@
   </header>
 
   {% if discovery_running %}
-  <div class="panel" style="margin-bottom: 1rem" id="discovery-banner">
-    <p class="hint" style="margin: 0; color: var(--ink)">
-      Discovery running: <strong id="discovery-progress">{{ discovery_progress or "…" }}</strong>
-      — this page stays usable; channel list updates when finished.
-    </p>
+  <div class="panel discovery-banner" style="margin-bottom: 1rem" id="discovery-banner">
+    <div class="discovery-banner-row">
+      <p class="hint" style="margin: 0; color: var(--ink)">
+        Discovery running: <strong id="discovery-progress">{{ discovery_progress or "…" }}</strong>
+        — this page stays usable; channel list updates when finished.
+      </p>
+      <button type="button" class="btn btn-stop btn-sm" id="stop-discovery-btn">Stop</button>
+    </div>
   </div>
   {% endif %}
 
@@ -98,114 +109,178 @@
 
   <section class="panel">
     <h2>Your seed channels</h2>
-    <div class="channel-grid">
+    <p class="hint" style="margin-top: -0.35rem; margin-bottom: 0.75rem">
+      Joined status is from this app’s join log. <strong>Muted</strong> means notifications were muted; <strong>Joined</strong> means subscribed but still unmuted. Use Settings → Refresh mute status to sync with Telegram.
+    </p>
+    <div class="channel-scroll">
+      <div class="channel-list">
       {% for c in seed_channels %}
-      <article class="channel {% if not c.included %}excluded{% endif %}" data-username="{{ c.username }}">
-        <div class="channel-head">
-          <div class="title">{{ c.title }}</div>
+      {% set is_joined = c.username.casefold() in joined_lookup %}
+      <article class="channel channel-row {% if not c.included %}excluded{% endif %}" data-username="{{ c.username }}">
+        <button
+          type="button"
+          class="star-btn {% if c.favorite %}is-fav{% endif %}"
+          data-username="{{ c.username }}"
+          aria-label="{% if c.favorite %}Remove from favorites{% else %}Add to favorites{% endif %}"
+          aria-pressed="{{ 'true' if c.favorite else 'false' }}"
+          title="{% if c.favorite %}Favorited{% else %}Add to favorites{% endif %}"
+        ></button>
+        <div class="channel-row-main">
+          <div class="title" title="{{ c.title }}">{{ c.title }}</div>
+          <div class="meta">
+            <a href="{{ c.link }}" target="_blank" rel="noopener">@{{ c.username }}</a>
+            {% if c.members %}
+            <span class="meta-sep">·</span>
+            <span class="meta-members">{{ "{:,}".format(c.members) }} members</span>
+            {% else %}
+            <span class="meta-sep">·</span>
+            <span class="meta-members">members pending</span>
+            {% endif %}
+          </div>
+        </div>
+        <div class="channel-row-actions">
+          <span class="badge {% if c.included %}ok{% else %}skip{% endif %}">
+            {% if c.included %}in{% else %}off{% endif %}
+          </span>
+          {% if is_joined %}
+          {% set st = joined_status.get(c.username.casefold(), {}) %}
+          {% if st.get('muted') %}
+          <span class="badge joined" data-joined-badge data-muted="1" title="Joined and muted">Muted</span>
+          {% else %}
+          <span class="badge joined joined-only" data-joined-badge data-muted="0" title="Joined but still unmuted">Joined</span>
+          {% endif %}
+          {% else %}
           <button
             type="button"
-            class="star-btn {% if c.favorite %}is-fav{% endif %}"
-            data-username="{{ c.username }}"
-            aria-label="{% if c.favorite %}Remove from favorites{% else %}Add to favorites{% endif %}"
-            aria-pressed="{{ 'true' if c.favorite else 'false' }}"
-            title="{% if c.favorite %}Favorited{% else %}Add to favorites{% endif %}"
-          ></button>
+            class="btn secondary btn-xs btn-join-muted"
+            data-join="{{ c.username }}"
+            title="Join this channel and mute notifications"
+          >Join muted</button>
+          {% endif %}
         </div>
-        <div class="meta">
-          <a href="{{ c.link }}" target="_blank" rel="noopener">@{{ c.username }}</a>
-          ·
-          {% if c.members %}{{ "{:,}".format(c.members) }} members{% else %}members pending — click Refresh list{% endif %}
-        </div>
-        <span class="badge {% if c.included %}ok{% else %}skip{% endif %}">
-          {% if c.included %}included{% else %}skipped{% endif %}
-        </span>
-        {% if c.reason and c.reason != "OK" and not c.reason.startswith("OK") %}
-        <div class="meta" style="margin-top: 0.35rem">{{ c.reason }}</div>
-        {% endif %}
       </article>
       {% else %}
-      <p class="hint">No seed channels in channels.txt</p>
+      <p class="hint" style="margin: 0.5rem">No seed channels in channels.txt</p>
       {% endfor %}
+      </div>
     </div>
   </section>
 
   <section class="panel">
     <h2>Discovered &amp; related channels</h2>
-    <p class="hint" style="margin-top: -0.35rem; margin-bottom: 1rem">
-      Valid channels only (invalid usernames are dropped). Toggle search use on
-      <a href="/manage">Manage channels</a>.
-      Member counts fill on <strong>Refresh list</strong> / <strong>Discover</strong>.
+    <p class="hint" style="margin-top: -0.35rem; margin-bottom: 0.75rem">
+      Valid channels only. Toggle search use on
+      <a href="/manage">Manage</a>.
+      Member counts fill on Refresh / Discover.
     </p>
-    <div class="channel-grid">
+    <div class="channel-scroll channel-scroll-tall">
+      <div class="channel-list">
       {% for c in other_channels if c.valid and c.included %}
-      <article class="channel" data-username="{{ c.username }}">
-        <div class="channel-head">
-          <div class="title">{{ c.title }}</div>
+      {% set is_joined = c.username.casefold() in joined_lookup %}
+      <article class="channel channel-row" data-username="{{ c.username }}">
+        <button
+          type="button"
+          class="star-btn {% if c.favorite %}is-fav{% endif %}"
+          data-username="{{ c.username }}"
+          aria-label="{% if c.favorite %}Remove from favorites{% else %}Add to favorites{% endif %}"
+          aria-pressed="{{ 'true' if c.favorite else 'false' }}"
+          title="{% if c.favorite %}Favorited{% else %}Add to favorites{% endif %}"
+        ></button>
+        <div class="channel-row-main">
+          <div class="title" title="{{ c.title }}">{{ c.title }}</div>
+          <div class="meta">
+            <a href="{{ c.link }}" target="_blank" rel="noopener">@{{ c.username }}</a>
+            {% if c.members %}
+            <span class="meta-sep">·</span>
+            <span class="meta-members">{{ "{:,}".format(c.members) }} members</span>
+            {% else %}
+            <span class="meta-sep">·</span>
+            <span class="meta-members">members pending</span>
+            {% endif %}
+          </div>
+        </div>
+        <div class="channel-row-actions">
+          <span class="badge ok">{{ c.source|source_label }}</span>
+          {% if is_joined %}
+          {% set st = joined_status.get(c.username.casefold(), {}) %}
+          {% if st.get('muted') %}
+          <span class="badge joined" data-joined-badge data-muted="1" title="Joined and muted">Muted</span>
+          {% else %}
+          <span class="badge joined joined-only" data-joined-badge data-muted="0" title="Joined but still unmuted">Joined</span>
+          {% endif %}
+          {% else %}
           <button
             type="button"
-            class="star-btn {% if c.favorite %}is-fav{% endif %}"
-            data-username="{{ c.username }}"
-            aria-label="{% if c.favorite %}Remove from favorites{% else %}Add to favorites{% endif %}"
-            aria-pressed="{{ 'true' if c.favorite else 'false' }}"
-            title="{% if c.favorite %}Favorited{% else %}Add to favorites{% endif %}"
-          ></button>
+            class="btn secondary btn-xs btn-join-muted"
+            data-join="{{ c.username }}"
+            title="Join this channel and mute notifications"
+          >Join muted</button>
+          {% endif %}
         </div>
-        <div class="meta">
-          <a href="{{ c.link }}" target="_blank" rel="noopener">@{{ c.username }}</a>
-          ·
-          {% if c.members %}{{ "{:,}".format(c.members) }} members{% else %}members pending{% endif %}
-        </div>
-        <span class="badge ok">{{ c.source }} · enabled</span>
-        {% if c.reason and c.reason != "OK" %}
-        <div class="meta" style="margin-top: 0.35rem">{{ c.reason }}</div>
-        {% endif %}
       </article>
       {% else %}
-      <p class="hint">
+      <p class="hint" style="margin: 0.5rem">
         None enabled yet. Use Discover / Deep crawl, then pick channels on
         <a href="/manage">Manage channels</a>.
       </p>
       {% endfor %}
+      </div>
     </div>
   </section>
 
   <section class="panel" id="favorites">
     <h2>★ Favorites</h2>
-    <p class="hint" style="margin-top: -0.35rem; margin-bottom: 1rem">
+    <p class="hint" style="margin-top: -0.35rem; margin-bottom: 0.75rem">
       Star any channel above (or here) to pin it for quick browsing.
     </p>
-    <div class="channel-grid fav-grid" id="favorites-grid">
+    <div class="channel-scroll" id="favorites-scroll">
+      <div class="channel-list fav-grid" id="favorites-grid">
       {% for c in favorite_channels %}
-      <article class="channel fav-channel" data-username="{{ c.username }}">
-        <div class="channel-head">
-          <div class="title">{{ c.title }}</div>
+      {% set is_joined = c.username.casefold() in joined_lookup %}
+      <article class="channel channel-row fav-channel" data-username="{{ c.username }}">
+        <button
+          type="button"
+          class="star-btn is-fav"
+          data-username="{{ c.username }}"
+          aria-label="Remove from favorites"
+          aria-pressed="true"
+          title="Favorited"
+        ></button>
+        <div class="channel-row-main">
+          <div class="title" title="{{ c.title }}">{{ c.title }}</div>
+          <div class="meta">
+            <a href="{{ c.link }}" target="_blank" rel="noopener">@{{ c.username }}</a>
+            {% if c.members %}
+            <span class="meta-sep">·</span>
+            <span class="meta-members">{{ "{:,}".format(c.members) }} members</span>
+            {% endif %}
+          </div>
+        </div>
+        <div class="channel-row-actions">
+          {% if is_joined %}
+          {% set st = joined_status.get(c.username.casefold(), {}) %}
+          {% if st.get('muted') %}
+          <span class="badge joined" data-joined-badge data-muted="1" title="Joined and muted">Muted</span>
+          {% else %}
+          <span class="badge joined joined-only" data-joined-badge data-muted="0" title="Joined but still unmuted">Joined</span>
+          {% endif %}
+          {% else %}
           <button
             type="button"
-            class="star-btn is-fav"
-            data-username="{{ c.username }}"
-            aria-label="Remove from favorites"
-            aria-pressed="true"
-            title="Favorited"
-          ></button>
-        </div>
-        <div class="meta">
-          <a href="{{ c.link }}" target="_blank" rel="noopener">@{{ c.username }}</a>
-          ·
-          {% if c.members %}{{ "{:,}".format(c.members) }} members{% else %}members unknown{% endif %}
-        </div>
-        {% if c.description %}
-        <div class="meta fav-desc">{{ c.description[:120] }}{% if c.description|length > 120 %}…{% endif %}</div>
-        {% endif %}
-        <div class="fav-actions">
-          <a class="btn" href="/channel/{{ c.username }}">Browse files</a>
+            class="btn secondary btn-xs btn-join-muted"
+            data-join="{{ c.username }}"
+            title="Join this channel and mute notifications"
+          >Join muted</button>
+          {% endif %}
+          <a class="btn btn-xs" href="/channel/{{ c.username }}">Browse</a>
         </div>
       </article>
       {% endfor %}
+      </div>
+      <p class="hint" id="favorites-empty" style="margin: 0.5rem" {% if favorite_channels %}hidden{% endif %}>
+        No favorites yet. Click the star on a channel to add it.
+      </p>
     </div>
-    <p class="hint" id="favorites-empty" {% if favorite_channels %}hidden{% endif %}>
-      No favorites yet. Click the star on a channel to add it.
-    </p>
   </section>
 </div>
 <script>
@@ -222,6 +297,63 @@
       .replaceAll(">", "&gt;")
       .replaceAll('"', "&quot;");
   }
+
+  const joinedUsernames = new Set({{ (joined_usernames|default([]))|list|tojson }});
+
+  function markJoined(username) {
+    const key = String(username || "").toLowerCase();
+    joinedUsernames.add(key);
+    document.querySelectorAll(`[data-username="${CSS.escape(username)}"]`).forEach((card) => {
+      const joinBtn = card.querySelector(".btn-join-muted");
+      const actions = joinBtn?.parentElement || card.querySelector(".channel-row-actions");
+      joinBtn?.remove();
+      if (actions && !actions.querySelector("[data-joined-badge]")) {
+        const badge = document.createElement("span");
+        badge.className = "badge joined";
+        badge.dataset.joinedBadge = "";
+        badge.dataset.muted = "1";
+        badge.title = "Joined and muted";
+        badge.textContent = "Muted";
+        actions.prepend(badge);
+      } else {
+        const badge = card.querySelector("[data-joined-badge]");
+        if (badge) {
+          badge.hidden = false;
+          badge.removeAttribute("hidden");
+          badge.dataset.muted = "1";
+          badge.textContent = "Muted";
+          badge.title = "Joined and muted";
+        }
+      }
+    });
+  }
+
+  document.addEventListener("click", async (ev) => {
+    const joinBtn = ev.target.closest(".btn-join-muted");
+    if (!joinBtn) return;
+    const username = joinBtn.dataset.join;
+    if (!username || joinBtn.disabled) return;
+    joinBtn.disabled = true;
+    const prev = joinBtn.textContent;
+    joinBtn.textContent = "…";
+    try {
+      const body = new FormData();
+      body.append("username", username);
+      const res = await fetch("/manage/join-muted", { method: "POST", body });
+      const data = await res.json();
+      if (data.ok || data.status === "already") {
+        markJoined(username);
+      } else {
+        alert(data.error || "Could not join channel");
+        joinBtn.disabled = false;
+        joinBtn.textContent = prev;
+      }
+    } catch (e) {
+      alert(String(e));
+      joinBtn.disabled = false;
+      joinBtn.textContent = prev;
+    }
+  });
 
   function syncStarButtons(username, favorite) {
     document.querySelectorAll(`.star-btn[data-username="${CSS.escape(username)}"]`).forEach((btn) => {
@@ -247,27 +379,30 @@
     }
     if (empty) empty.hidden = true;
     if (existing) return;
-    const members = "";
     const card = document.createElement("article");
-    card.className = "channel fav-channel";
+    card.className = "channel channel-row fav-channel";
     card.dataset.username = data.username;
+    const isJoined = joinedUsernames.has(String(data.username).toLowerCase());
     card.innerHTML = `
-      <div class="channel-head">
+      <button
+        type="button"
+        class="star-btn is-fav"
+        data-username="${escapeHtml(data.username)}"
+        aria-label="Remove from favorites"
+        aria-pressed="true"
+        title="Favorited"
+      ></button>
+      <div class="channel-row-main">
         <div class="title">${escapeHtml(data.title || data.username)}</div>
-        <button
-          type="button"
-          class="star-btn is-fav"
-          data-username="${escapeHtml(data.username)}"
-          aria-label="Remove from favorites"
-          aria-pressed="true"
-          title="Favorited"
-        ></button>
+        <div class="meta">
+          <a href="https://t.me/${escapeHtml(data.username)}" target="_blank" rel="noopener">@${escapeHtml(data.username)}</a>
+        </div>
       </div>
-      <div class="meta">
-        <a href="https://t.me/${escapeHtml(data.username)}" target="_blank" rel="noopener">@${escapeHtml(data.username)}</a>
-      </div>
-      <div class="fav-actions">
-        <a class="btn" href="/channel/${escapeHtml(data.username)}">Browse files</a>
+      <div class="channel-row-actions">
+        ${isJoined
+          ? `<span class="badge joined" data-joined-badge data-muted="1" title="Joined and muted">Muted</span>`
+          : `<button type="button" class="btn secondary btn-xs btn-join-muted" data-join="${escapeHtml(data.username)}" title="Join this channel and mute notifications">Join muted</button>`}
+        <a class="btn btn-xs" href="/channel/${escapeHtml(data.username)}">Browse</a>
       </div>`;
     grid.prepend(card);
   }
@@ -310,6 +445,22 @@
     } catch (e) {}
     setTimeout(pollDiscovery, 1500);
   })();
+
+  document.getElementById("stop-discovery-btn")?.addEventListener("click", async () => {
+    const btn = document.getElementById("stop-discovery-btn");
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Stopping…";
+    }
+    try {
+      await fetch("/channels/stop", { method: "POST", headers: { Accept: "application/json" } });
+    } catch (e) {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "Stop";
+      }
+    }
+  });
   {% endif %}
 </script>
 {% endblock %}

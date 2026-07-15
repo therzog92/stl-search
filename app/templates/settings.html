@@ -1,0 +1,210 @@
+{% extends "base.html" %}
+{% block title %}Settings · STL Search{% endblock %}
+{% block body %}
+<div class="shell">
+  <header class="brand">
+    <div>
+      <h1>Settings</h1>
+      <p>Telegram API keys, account join/leave, and channel-list transfer.</p>
+    </div>
+  </header>
+
+  {% if message %}
+  <div class="panel" style="margin-bottom: 1rem; border-color: rgba(216, 255, 62, 0.35)">
+    <p class="hint" style="margin: 0; color: var(--ink)">{{ message }}</p>
+  </div>
+  {% endif %}
+  {% if error %}
+  <div class="error" style="margin-bottom: 1rem">{{ error }}</div>
+  {% endif %}
+
+  {% if job_running %}
+  <div class="panel" style="margin-bottom: 1rem">
+    <div class="discovery-banner-row">
+      <p class="hint" id="settings-job-progress" style="margin: 0; color: var(--ink)">
+        {{ job_progress or "Working…" }}
+      </p>
+      <button type="button" class="btn btn-stop btn-sm" id="stop-discovery-btn">Stop</button>
+    </div>
+  </div>
+  {% else %}
+  <p class="hint" id="settings-job-progress" hidden></p>
+  {% endif %}
+
+  <section class="panel">
+    <h2>Channels on this Telegram account</h2>
+    <p class="hint" style="margin-top: -0.25rem">
+      Still need join: <strong>{{ unjoined_enabled_count }}</strong>
+      · joined but unmuted (log): <strong>{{ joined_unmuted_count }}</strong>
+      · tracked for leave: <strong>{{ joined_tracked_count }}</strong>
+    </p>
+
+    {% if web_join_running and web_join_phase != "joining" %}
+    <div class="panel" id="web-join-continue-banner" style="margin: 0.75rem 0; border-color: rgba(216, 255, 62, 0.4)">
+      <p class="hint" style="margin: 0 0 0.75rem; color: var(--ink)">
+        Chromium should be open on Telegram Web. Log in (QR / phone) if needed, then continue.
+      </p>
+      <form method="post" action="/settings/join-web/continue" class="inline-form">
+        <button class="btn" type="submit">I’m logged in — Continue joining</button>
+      </form>
+    </div>
+    {% endif %}
+
+    <div class="settings-actions" style="margin-top: 0.75rem">
+      <form method="post" action="/settings/join-web/start" class="inline-form"
+            onsubmit="return confirm('Open Telegram Web and auto-click Join for enabled unjoined channels? A Chromium window will appear.');">
+        <button class="btn" type="submit" {% if job_running or search_running %}disabled{% endif %}>
+          {% if web_join_running %}Auto-joining…{% else %}Auto-join via Telegram Web{% endif %}
+        </button>
+      </form>
+      <form method="post" action="/settings/join-muted" class="inline-form"
+            onsubmit="return confirm('Mute channels you already joined (API)? Prefer finishing Auto-join first.');">
+        <button class="btn secondary" type="submit" {% if job_running or search_running %}disabled{% endif %}>
+          {% if join_running %}Working…{% else %}Mute after joining{% endif %}
+        </button>
+      </form>
+      <form method="post" action="/settings/sync-mute" class="inline-form">
+        <button class="btn secondary" type="submit" {% if job_running or search_running %}disabled{% endif %}>
+          {% if mute_sync_running %}Syncing…{% else %}Refresh mute status{% endif %}
+        </button>
+      </form>
+    </div>
+    <ol class="hint" style="margin: 0.85rem 0 0; padding-left: 1.25rem">
+      <li><strong>Auto-join via Telegram Web</strong> — clicks Join in the official website (no API join storm).</li>
+      <li><strong>Mute after joining</strong> — mutes joined channels via Telegram API.</li>
+      <li><strong>Refresh mute status</strong> — reads real mute/unmute from Telegram and fixes the log (badges).</li>
+    </ol>
+
+    <div style="margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--line)">
+      <h3 style="margin: 0 0 0.5rem; font-size: 1rem">Leave app-joined channels</h3>
+      <p class="hint" style="margin-top: 0">
+        Type <strong>LEAVE</strong> below to confirm. Only channels this app newly joined are removed.
+      </p>
+      <form method="post" action="/settings/leave-joined" class="settings-form"
+            onsubmit="return (document.getElementById('leave-confirm').value || '').trim() === 'LEAVE' || (alert('Type LEAVE in all caps to confirm.'), false);">
+        <label for="leave-confirm">Confirmation</label>
+        <div class="add-row" style="display: flex; gap: 0.65rem; flex-wrap: wrap; align-items: center">
+          <input
+            id="leave-confirm"
+            name="confirm"
+            type="text"
+            placeholder="Type LEAVE"
+            autocomplete="off"
+            {% if job_running or search_running %}disabled{% endif %}
+          />
+          <button class="btn secondary" type="submit" {% if job_running or search_running or leave_running %}disabled{% endif %}>
+            {% if leave_running %}Leaving…{% else %}Leave app-joined channels{% endif %}
+          </button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Telegram API keys</h2>
+    <p class="hint" style="margin-top: -0.25rem">
+      From <a href="https://my.telegram.org/apps" target="_blank" rel="noopener">my.telegram.org/apps</a>.
+      Current ID: <strong>{{ api_id or "—" }}</strong>
+      · hash: <code>{{ api_hash_masked or "—" }}</code>
+    </p>
+    <form method="post" action="/settings/api-keys" class="settings-form">
+      <div class="row">
+        <div>
+          <label for="api_id">API ID</label>
+          <input id="api_id" name="api_id" type="number" inputmode="numeric" required
+                 placeholder="12345678" value="{{ form_api_id or '' }}" />
+        </div>
+        <div>
+          <label for="api_hash">API Hash</label>
+          <input id="api_hash" name="api_hash" type="text" required autocomplete="off"
+                 placeholder="Paste new hash" value="{{ form_api_hash or '' }}" />
+        </div>
+      </div>
+
+      <fieldset class="settings-fieldset">
+        <legend>Channel list when switching</legend>
+        <label class="radio-row">
+          <input type="radio" name="channel_data" value="transfer" checked />
+          <span>
+            <strong>Transfer</strong> — keep seeds, discovered channels, favorites, blacklist.
+            You’ll re-login; then re-run Join muted on the new account if needed.
+          </span>
+        </label>
+        <label class="radio-row">
+          <input type="radio" name="channel_data" value="fresh" />
+          <span>
+            <strong>Start fresh</strong> — wipe discovered / manage cache / blacklist / join log.
+            Keeps <code>channels.txt</code> seeds only.
+          </span>
+        </label>
+      </fieldset>
+
+      <p class="hint">
+        Saving new keys logs out the current session (API credentials are tied to the session).
+        You will sign in again on the Login page.
+      </p>
+      <button class="btn" type="submit" {% if job_running or search_running %}disabled{% endif %}
+              onclick="return confirm('Update API keys and log out this session?');">
+        Save API keys &amp; re-login
+      </button>
+    </form>
+  </section>
+
+  <section class="panel">
+    <h2>Session</h2>
+    <p class="hint" style="margin-top: -0.25rem">
+      Log out without changing API keys. Channel lists stay on disk.
+    </p>
+    <form method="post" action="/settings/logout" class="inline-form"
+          onsubmit="return confirm('Log out of Telegram on this machine?');">
+      <button class="btn secondary" type="submit" {% if job_running or search_running %}disabled{% endif %}>
+        Log out
+      </button>
+    </form>
+  </section>
+</div>
+{% if job_running %}
+<script>
+  (async function pollSettingsJob() {
+    try {
+      const res = await fetch("/api/discovery");
+      const data = await res.json();
+      const el = document.getElementById("settings-job-progress");
+      if (el && data.progress) {
+        el.hidden = false;
+        el.textContent = data.progress;
+        el.style.color = "var(--ink)";
+      }
+      // Show Continue when browser is waiting for login
+      if (data.running && data.mode === "join_web" && data.phase === "await_login") {
+        if (!document.getElementById("web-join-continue-banner")) {
+          window.location.reload();
+          return;
+        }
+      }
+      if (!data.running) {
+        window.location.href = "/settings";
+        return;
+      }
+    } catch (e) {}
+    setTimeout(pollSettingsJob, 1500);
+  })();
+
+  document.getElementById("stop-discovery-btn")?.addEventListener("click", async () => {
+    const btn = document.getElementById("stop-discovery-btn");
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Stopping…";
+    }
+    try {
+      await fetch("/channels/stop", { method: "POST", headers: { Accept: "application/json" } });
+    } catch (e) {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "Stop";
+      }
+    }
+  });
+</script>
+{% endif %}
+{% endblock %}

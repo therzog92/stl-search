@@ -21,6 +21,7 @@
         <a class="site-nav-link" href="/#favorites" data-nav="favorites">Favorites</a>
         <a class="site-nav-link" href="/manage" data-nav="manage">Manage</a>
         <a class="site-nav-link" href="/downloads" data-nav="downloads">Downloads</a>
+        <a class="site-nav-link" href="/settings" data-nav="settings">Settings</a>
       </nav>
     </header>
     {% endblock %}
@@ -52,6 +53,7 @@
               active = path === "/" && hash === "#favorites";
             } else if (key === "manage") active = path === "/manage";
             else if (key === "downloads") active = path === "/downloads";
+            else if (key === "settings") active = path === "/settings";
             a.classList.toggle("is-active", active);
           });
         }

@@ -11,6 +11,7 @@ Rules:
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import tempfile
 import zipfile
@@ -147,7 +148,8 @@ def _safe_extract_with_tool(archive: Path, dest: Path) -> None:
     tool = _find_extractor()
     if not tool:
         raise RuntimeError(
-            "RAR needs 7-Zip or WinRAR installed (ZIP still extracts automatically)."
+            "RAR needs unrar or 7-Zip in the container/PATH "
+            "(on Windows: install 7-Zip or WinRAR). ZIP still extracts automatically."
         )
     kind, exe = tool
     dest.mkdir(parents=True, exist_ok=True)
@@ -156,8 +158,8 @@ def _safe_extract_with_tool(archive: Path, dest: Path) -> None:
     if kind == "7z":
         cmd = [str(exe), "x", f"-o{dest}", "-y", "--", str(archive)]
     else:
-        # UnRAR x -y archive dest\
-        cmd = [str(exe), "x", "-y", "-o+", str(archive), str(dest) + "\\"]
+        # UnRAR x -y archive dest/
+        cmd = [str(exe), "x", "-y", "-o+", str(archive), str(dest) + os.sep]
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}"

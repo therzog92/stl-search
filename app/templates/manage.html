@@ -1,6 +1,8 @@
 {% extends "base.html" %}
 {% block title %}Manage channels · STL Search{% endblock %}
 {% block body %}
+{% set joined_lookup = joined_lookup if joined_lookup is defined else {} %}
+{% set joined_status = joined_status if joined_status is defined else {} %}
 <div class="shell">
   <header class="brand">
     <div>
@@ -54,11 +56,22 @@
         </p>
         {% if enrich_running %}
         <p class="hint" id="enrich-progress" style="margin: 0.35rem 0 0; color: var(--ink)">
-          {{ enrich_progress or "Fetching details…" }}
+          {{ enrich_progress or "Working…" }}
+          <button type="button" class="btn btn-stop btn-sm" id="stop-discovery-btn" style="margin-left: 0.65rem">Stop</button>
         </p>
         {% else %}
         <p class="hint" id="enrich-progress" style="margin: 0.35rem 0 0" hidden></p>
         {% endif %}
+        {% if joined_tracked_count %}
+        <p class="hint" style="margin: 0.35rem 0 0">
+          {{ joined_tracked_count }} channel(s) tracked for leave —
+          use <a href="/settings">Settings</a>.
+        </p>
+        {% endif %}
+        <p class="hint" style="margin: 0.35rem 0 0">
+          Still need join/mute: <strong>{{ unjoined_enabled_count }}</strong>
+          · easiest: <a href="/settings"><strong>Settings → Open join list</strong></a>
+        </p>
       </div>
     </div>
 
@@ -68,11 +81,12 @@
           class="btn secondary"
           type="submit"
           id="enrich-btn"
-          {% if enrich_running %}disabled{% endif %}
+          {% if job_running %}disabled{% endif %}
         >
           {% if enrich_running %}Fetching details…{% else %}Load members &amp; descriptions{% endif %}
         </button>
       </form>
+      <a class="btn" href="/manage/export-unjoined?fmt=html">Open join list</a>
 
       <div class="manage-select-tools">
         <button type="button" class="btn secondary" id="select-none">Deselect all</button>
@@ -93,7 +107,82 @@
     </div>
 
     <div id="manage-form">
-      <div class="manage-table-wrap">
+      <div class="manage-card-list" id="channel-cards">
+        {% for c in channels %}
+        {% set is_joined = c.username.casefold() in joined_lookup %}
+        <article
+          class="manage-card{% if not c.included %} row-off{% endif %}{% if c.favorite %} row-fav{% endif %}"
+          data-members="{{ c.members or 0 }}"
+          data-username="{{ c.username }}"
+        >
+          <div class="manage-card-top">
+            <div class="manage-card-toggles">
+              <label>
+                <input
+                  type="checkbox"
+                  name="enabled"
+                  value="{{ c.username }}"
+                  {% if c.included %}checked{% endif %}
+                />
+                Use
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  class="fav-check"
+                  name="favorite"
+                  value="{{ c.username }}"
+                  {% if c.favorite %}checked{% endif %}
+                />
+                ★
+              </label>
+            </div>
+            <div class="manage-card-actions row-actions">
+              <a class="btn secondary btn-sm" href="/channel/{{ c.username }}">Browse</a>
+              {% if not is_joined %}
+              <button
+                class="btn secondary btn-sm btn-join-muted"
+                type="button"
+                data-join="{{ c.username }}"
+                title="Join muted"
+              >Join muted</button>
+              {% endif %}
+              <button
+                class="btn secondary btn-sm btn-ban"
+                type="button"
+                data-ban="{{ c.username }}"
+                title="Ban / remove from list"
+              >Ban</button>
+            </div>
+          </div>
+          <h3 class="manage-card-title">{{ c.title or c.username }}</h3>
+          <div class="manage-card-user">
+            <a href="{{ c.link }}" target="_blank" rel="noopener">@{{ c.username }}</a>
+          </div>
+          <div class="manage-card-meta">
+            <span>{% if c.members %}{{ "{:,}".format(c.members) }} members{% else %}Members —{% endif %}</span>
+            <span class="pill">{{ c.source|source_label }}</span>
+            {% if is_joined %}
+            {% set st = joined_status.get(c.username.casefold(), {}) %}
+            {% if st.get('muted') %}
+            <span class="badge joined" data-joined-badge data-muted="1" title="Joined and muted">Muted</span>
+            {% else %}
+            <span class="badge joined joined-only" data-joined-badge data-muted="0" title="Joined but still unmuted">Joined</span>
+            {% endif %}
+            {% endif %}
+          </div>
+          {% if c.description %}
+          <div class="manage-card-desc" title="{{ c.description }}">
+            {{ c.description[:140] }}{% if c.description|length > 140 %}…{% endif %}
+          </div>
+          {% endif %}
+        </article>
+        {% else %}
+        <p class="hint" id="empty-channels-cards">No channels yet.</p>
+        {% endfor %}
+      </div>
+
+      <div class="manage-table-wrap manage-table-wrap--desktop">
         <table class="manage-table">
           <thead>
             <tr>
@@ -103,12 +192,14 @@
               <th>Name</th>
               <th>Members</th>
               <th>Source</th>
+              <th>Status</th>
               <th>Description</th>
               <th></th>
             </tr>
           </thead>
           <tbody id="channel-tbody">
             {% for c in channels %}
+            {% set is_joined = c.username.casefold() in joined_lookup %}
             <tr
               class="{% if not c.included %}row-off{% endif %}{% if c.favorite %} row-fav{% endif %}"
               data-members="{{ c.members or 0 }}"
@@ -140,7 +231,19 @@
                 {% if c.members %}{{ "{:,}".format(c.members) }}{% else %}
                 <span class="muted">—</span>{% endif %}
               </td>
-              <td><span class="pill">{{ c.source }}</span></td>
+              <td><span class="pill">{{ c.source|source_label }}</span></td>
+              <td class="col-joined">
+                {% if is_joined %}
+                {% set st = joined_status.get(c.username.casefold(), {}) %}
+                {% if st.get('muted') %}
+                <span class="badge joined" data-joined-badge data-muted="1" title="Joined and muted">Muted</span>
+                {% else %}
+                <span class="badge joined joined-only" data-joined-badge data-muted="0" title="Joined but still unmuted">Joined</span>
+                {% endif %}
+                {% else %}
+                <span class="muted" data-not-joined>—</span>
+                {% endif %}
+              </td>
               <td class="col-desc" title="{{ c.description }}">
                 {% if c.description %}
                   {{ c.description[:140] }}{% if c.description|length > 140 %}…{% endif %}
@@ -151,6 +254,14 @@
               <td>
                 <div class="row-actions">
                   <a class="btn secondary btn-sm" href="/channel/{{ c.username }}">Browse</a>
+                  {% if not is_joined %}
+                  <button
+                    class="btn secondary btn-sm btn-join-muted"
+                    type="button"
+                    data-join="{{ c.username }}"
+                    title="Join muted"
+                  >Join muted</button>
+                  {% endif %}
                   <button
                     class="btn secondary btn-sm btn-ban"
                     type="button"
@@ -162,7 +273,7 @@
             </tr>
             {% else %}
             <tr id="empty-channels-row">
-              <td colspan="8" class="hint">No channels yet.</td>
+              <td colspan="9" class="hint">No channels yet.</td>
             </tr>
             {% endfor %}
           </tbody>
@@ -243,6 +354,20 @@
   </section>
 </div>
 <script>
+  const joinedUsernames = new Set({{ (joined_usernames|default([]))|list|tojson }});
+  const SOURCE_LABELS = {
+    seed: "seed",
+    catalog: "catalog",
+    similar: "similar",
+    linked: "linked",
+    search: "search",
+    joined: "from chats",
+    discovered: "discovered",
+  };
+  function sourceLabel(source) {
+    const key = String(source || "").toLowerCase();
+    return SOURCE_LABELS[key] || source || "unknown";
+  }
   const enabledBoxes = () =>
     document.querySelectorAll('#manage-form input[name="enabled"]');
   const favoriteBoxes = () =>
@@ -251,8 +376,71 @@
   let saveTimer = null;
   let saving = false;
 
+  function markJoined(username) {
+    const key = String(username || "").toLowerCase();
+    joinedUsernames.add(key);
+    document.querySelectorAll(`[data-username="${CSS.escape(username)}"]`).forEach((el) => {
+      el.querySelectorAll("[data-not-joined]").forEach((b) => b.remove());
+      el.querySelectorAll(".btn-join-muted").forEach((btn) => btn.remove());
+      if (!el.querySelector("[data-joined-badge]")) {
+        const badge = document.createElement("span");
+        badge.className = "badge joined";
+        badge.dataset.joinedBadge = "";
+        badge.dataset.muted = "1";
+        badge.title = "Joined and muted";
+        badge.textContent = "Muted";
+        const meta = el.querySelector(".manage-card-meta, .col-joined, .row-actions");
+        const joinedCell = el.querySelector(".col-joined");
+        if (joinedCell) {
+          joinedCell.textContent = "";
+          joinedCell.appendChild(badge);
+        } else if (meta && meta.classList.contains("manage-card-meta")) {
+          meta.appendChild(badge);
+        }
+      }
+    });
+  }
+
+  document.addEventListener("click", async (ev) => {
+    const joinBtn = ev.target.closest(".btn-join-muted");
+    if (!joinBtn) return;
+    const username = joinBtn.dataset.join;
+    if (!username || joinBtn.disabled) return;
+    joinBtn.disabled = true;
+    const prev = joinBtn.textContent;
+    joinBtn.textContent = "…";
+    try {
+      const body = new FormData();
+      body.append("username", username);
+      const res = await fetch("/manage/join-muted", { method: "POST", body });
+      const data = await res.json();
+      if (data.ok || data.status === "already") {
+        markJoined(username);
+      } else {
+        alert(data.error || "Could not join channel");
+        joinBtn.disabled = false;
+        joinBtn.textContent = prev;
+      }
+    } catch (e) {
+      alert(String(e));
+      joinBtn.disabled = false;
+      joinBtn.textContent = prev;
+    }
+  });
+
   function setStatus(text) {
     if (saveStatus) saveStatus.textContent = text ? ` · ${text}` : "";
+  }
+
+  function syncNamedChecks(name, username, checked) {
+    document
+      .querySelectorAll(`#manage-form input[name="${name}"][value="${CSS.escape(username)}"]`)
+      .forEach((cb) => {
+        cb.checked = checked;
+      });
+    document
+      .querySelectorAll(`#manage-form [data-username="${CSS.escape(username)}"]`)
+      .forEach((row) => updateRowState(row));
   }
 
   function updateRowState(row) {
@@ -261,6 +449,18 @@
     const fav = row.querySelector('input[name="favorite"]')?.checked;
     row.classList.toggle("row-off", !enabled);
     row.classList.toggle("row-fav", !!fav);
+  }
+
+  function uniqueChecked(name) {
+    const seen = new Set();
+    const values = [];
+    document.querySelectorAll(`#manage-form input[name="${name}"]`).forEach((cb) => {
+      if (cb.checked && !seen.has(cb.value)) {
+        seen.add(cb.value);
+        values.push(cb.value);
+      }
+    });
+    return values;
   }
 
   function updateStats(data) {
@@ -275,12 +475,8 @@
     setStatus("Saving…");
     const body = new FormData();
     body.set("ajax", "1");
-    enabledBoxes().forEach((cb) => {
-      if (cb.checked) body.append("enabled", cb.value);
-    });
-    favoriteBoxes().forEach((cb) => {
-      if (cb.checked) body.append("favorite", cb.value);
-    });
+    uniqueChecked("enabled").forEach((v) => body.append("enabled", v));
+    uniqueChecked("favorite").forEach((v) => body.append("favorite", v));
     try {
       const res = await fetch("/manage/save", {
         method: "POST",
@@ -309,34 +505,35 @@
     const t = ev.target;
     if (!(t instanceof HTMLInputElement)) return;
     if (t.name !== "enabled" && t.name !== "favorite") return;
-    updateRowState(t.closest("tr"));
+    syncNamedChecks(t.name, t.value, t.checked);
     scheduleSave();
   });
 
   document.getElementById("select-all")?.addEventListener("click", () => {
-    enabledBoxes().forEach((cb) => {
-      cb.checked = true;
-      updateRowState(cb.closest("tr"));
-    });
+    const users = new Set();
+    enabledBoxes().forEach((cb) => users.add(cb.value));
+    users.forEach((u) => syncNamedChecks("enabled", u, true));
     autoSave();
   });
 
   document.getElementById("select-none")?.addEventListener("click", () => {
-    enabledBoxes().forEach((cb) => {
-      cb.checked = false;
-      updateRowState(cb.closest("tr"));
-    });
+    const users = new Set();
+    enabledBoxes().forEach((cb) => users.add(cb.value));
+    users.forEach((u) => syncNamedChecks("enabled", u, false));
     autoSave();
   });
 
   document.getElementById("select-above")?.addEventListener("click", () => {
     const input = document.getElementById("member-threshold");
     const threshold = Number(input?.value || 0);
-    enabledBoxes().forEach((cb) => {
-      const row = cb.closest("tr");
-      const members = Number(row?.dataset.members || 0);
-      cb.checked = members >= threshold;
-      updateRowState(row);
+    const rows = document.querySelectorAll("#manage-form [data-username]");
+    const seen = new Set();
+    rows.forEach((row) => {
+      const username = row.dataset.username;
+      if (!username || seen.has(username)) return;
+      seen.add(username);
+      const members = Number(row.dataset.members || 0);
+      syncNamedChecks("enabled", username, members >= threshold);
     });
     autoSave();
   });
@@ -354,7 +551,9 @@
   }
 
   async function banChannel(username, btn) {
-    const row = btn.closest("tr");
+    const rows = document.querySelectorAll(
+      `#manage-form [data-username="${CSS.escape(username)}"]`
+    );
     const body = new FormData();
     body.set("username", username);
     btn.disabled = true;
@@ -378,7 +577,7 @@
       const link = data.link || `https://t.me/${username}`;
       const source = data.source || "";
 
-      row?.remove();
+      rows.forEach((row) => row.remove());
       const tbody = ensureBlacklistTable();
       if (tbody) {
         const tr = document.createElement("tr");
@@ -430,40 +629,92 @@
 
       row?.remove();
       const channelBody = document.getElementById("channel-tbody");
+      const cardList = document.getElementById("channel-cards");
       document.getElementById("empty-channels-row")?.remove();
+      document.getElementById("empty-channels-cards")?.remove();
+      const membersHtml = data.members
+        ? Number(data.members).toLocaleString()
+        : '<span class="muted">—</span>';
+      const desc = (data.description || "").trim();
+      const descHtml = desc
+        ? `${escapeHtml(desc.slice(0, 140))}${desc.length > 140 ? "…" : ""}`
+        : '<span class="muted">—</span>';
+      const title = data.title || username;
+      const source = data.source || "";
+      const link = data.link || `https://t.me/${username}`;
+
       if (channelBody) {
-        const membersHtml = data.members
-          ? Number(data.members).toLocaleString()
-          : '<span class="muted">—</span>';
-        const desc = (data.description || "").trim();
-        const descHtml = desc
-          ? `${escapeHtml(desc.slice(0, 140))}${desc.length > 140 ? "…" : ""}`
-          : '<span class="muted">—</span>';
         const tr = document.createElement("tr");
         tr.dataset.members = String(data.members || 0);
         tr.dataset.username = username;
         if (!data.included) tr.classList.add("row-off");
         if (data.favorite) tr.classList.add("row-fav");
+        const isJoined = joinedUsernames.has(String(username).toLowerCase());
         tr.innerHTML = `
           <td class="col-check"><input type="checkbox" name="enabled" value="${escapeHtml(username)}" ${data.included ? "checked" : ""} /></td>
           <td class="col-check"><input type="checkbox" class="fav-check" name="favorite" value="${escapeHtml(username)}" ${data.favorite ? "checked" : ""} title="Favorite" /></td>
-          <td><a href="${escapeHtml(data.link || `https://t.me/${username}`)}" target="_blank" rel="noopener">@${escapeHtml(username)}</a></td>
+          <td><a href="${escapeHtml(link)}" target="_blank" rel="noopener">@${escapeHtml(username)}</a></td>
           <td></td>
           <td class="col-members">${membersHtml}</td>
           <td><span class="pill"></span></td>
+          <td class="col-joined">
+            ${isJoined
+              ? `<span class="badge joined" data-joined-badge data-muted="1" title="Joined and muted">Muted</span>`
+              : `<span class="muted" data-not-joined>—</span>`}
+          </td>
           <td class="col-desc"></td>
           <td>
             <div class="row-actions">
               <a class="btn secondary btn-sm" href="/channel/${encodeURIComponent(username)}">Browse</a>
+              ${isJoined ? "" : `<button class="btn secondary btn-sm btn-join-muted" type="button" data-join="${escapeHtml(username)}" title="Join muted">Join muted</button>`}
               <button class="btn secondary btn-sm btn-ban" type="button" data-ban="${escapeHtml(username)}" title="Ban / remove from list">Ban</button>
             </div>
           </td>`;
-        tr.children[3].textContent = data.title || username;
-        tr.querySelector(".pill").textContent = data.source || "";
+        tr.children[3].textContent = title;
+        tr.querySelector(".pill").textContent = sourceLabel(source);
         const descEl = tr.querySelector(".col-desc");
         descEl.innerHTML = descHtml;
         descEl.title = desc;
         channelBody.prepend(tr);
+      }
+      if (cardList) {
+        const card = document.createElement("article");
+        card.className = "manage-card";
+        if (!data.included) card.classList.add("row-off");
+        if (data.favorite) card.classList.add("row-fav");
+        card.dataset.members = String(data.members || 0);
+        card.dataset.username = username;
+        const isJoined = joinedUsernames.has(String(username).toLowerCase());
+        card.innerHTML = `
+          <div class="manage-card-top">
+            <div class="manage-card-toggles">
+              <label><input type="checkbox" name="enabled" value="${escapeHtml(username)}" ${data.included ? "checked" : ""} /> Use</label>
+              <label><input type="checkbox" class="fav-check" name="favorite" value="${escapeHtml(username)}" ${data.favorite ? "checked" : ""} /> ★</label>
+            </div>
+            <div class="manage-card-actions row-actions">
+              <a class="btn secondary btn-sm" href="/channel/${encodeURIComponent(username)}">Browse</a>
+              ${isJoined ? "" : `<button class="btn secondary btn-sm btn-join-muted" type="button" data-join="${escapeHtml(username)}" title="Join muted">Join muted</button>`}
+              <button class="btn secondary btn-sm btn-ban" type="button" data-ban="${escapeHtml(username)}" title="Ban / remove from list">Ban</button>
+            </div>
+          </div>
+          <h3 class="manage-card-title"></h3>
+          <div class="manage-card-user"><a href="${escapeHtml(link)}" target="_blank" rel="noopener">@${escapeHtml(username)}</a></div>
+          <div class="manage-card-meta">
+            <span>${data.members ? `${Number(data.members).toLocaleString()} members` : "Members —"}</span>
+            <span class="pill"></span>
+            ${isJoined
+              ? `<span class="badge joined" data-joined-badge data-muted="1" title="Joined and muted">Muted</span>`
+              : ``}
+          </div>
+          ${desc ? `<div class="manage-card-desc"></div>` : ""}`;
+        card.querySelector(".manage-card-title").textContent = title;
+        card.querySelector(".pill").textContent = sourceLabel(source);
+        const cardDesc = card.querySelector(".manage-card-desc");
+        if (cardDesc) {
+          cardDesc.textContent = desc.slice(0, 140) + (desc.length > 140 ? "…" : "");
+          cardDesc.title = desc;
+        }
+        cardList.prepend(card);
       }
       const blBody = document.getElementById("blacklist-tbody");
       if (blBody && !blBody.children.length) {
@@ -481,7 +732,7 @@
     }
   }
 
-  document.getElementById("channel-tbody")?.addEventListener("click", (ev) => {
+  document.getElementById("manage-form")?.addEventListener("click", (ev) => {
     const btn = ev.target.closest("[data-ban]");
     if (!btn) return;
     banChannel(btn.getAttribute("data-ban"), btn);
@@ -494,23 +745,41 @@
   });
 
   {% if enrich_running %}
-  (async function pollEnrich() {
+  (async function pollJob() {
     try {
       const res = await fetch("/api/discovery");
       const data = await res.json();
       const el = document.getElementById("enrich-progress");
       if (el && data.progress) {
         el.hidden = false;
-        el.textContent = data.progress;
+        el.innerHTML = `${data.progress} <button type="button" class="btn btn-stop btn-sm" id="stop-discovery-btn" style="margin-left: 0.65rem">Stop</button>`;
         el.style.color = "var(--ink)";
+        document.getElementById("stop-discovery-btn")?.addEventListener("click", stopDiscovery);
       }
       if (!data.running) {
         window.location.href = "/manage";
         return;
       }
     } catch (e) {}
-    setTimeout(pollEnrich, 1500);
+    setTimeout(pollJob, 1500);
   })();
+
+  async function stopDiscovery() {
+    const btn = document.getElementById("stop-discovery-btn");
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Stopping…";
+    }
+    try {
+      await fetch("/channels/stop", { method: "POST", headers: { Accept: "application/json" } });
+    } catch (e) {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "Stop";
+      }
+    }
+  }
+  document.getElementById("stop-discovery-btn")?.addEventListener("click", stopDiscovery);
   {% endif %}
 </script>
 {% endblock %}

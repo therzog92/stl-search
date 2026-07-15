@@ -8,8 +8,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential \
+# RAR extract needs the proprietary unrar binary (non-free) and/or 7-Zip.
+RUN sed -i -E 's/Components: (.*)/Components: \1 contrib non-free non-free-firmware/' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        p7zip-full \
+        unrar \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

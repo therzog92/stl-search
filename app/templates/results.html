@@ -26,15 +26,10 @@
     <div class="search-status-row">
       <span class="search-status-chip" id="status">{{ state.status }}</span>
       <span class="search-status-progress" id="progress-text" title="{{ state.progress }}">{{ state.progress }}</span>
-      {% if not browse %}
       <span class="search-status-meta">
-        <strong id="channel-progress">{{ state.channels_scanned }}/{{ state.channels_total }}</strong> ch
-      </span>
-      {% else %}
-      <span class="search-status-meta" id="channel-progress-wrap" hidden>
         <strong id="channel-progress">{{ state.channels_scanned }}/{{ state.channels_total }}</strong>
+        <span id="channel-progress-label">{% if browse %}ch{% else %}terms{% endif %}</span>
       </span>
-      {% endif %}
       <span class="search-status-meta">
         <strong id="hit-count">{{ state.results|length }}</strong> files
         <span class="muted-sep" id="source-count-wrap"></span>
@@ -47,11 +42,14 @@
       <div class="progress-fill" id="progress-fill"></div>
     </div>
     {% if variants %}
-    <div class="search-status-variants hint">
-      {% for v in variants %}<span class="pill">{{ v }}</span>{% endfor %}
+    <div class="search-status-variants" id="status-variants">
+      {% for v in variants %}<span class="pill" data-variant="{{ v }}">{{ v }}</span>{% endfor %}
     </div>
     {% endif %}
-    <div id="errors"></div>
+    <div class="search-status-errors" id="errors" hidden>
+      <div class="search-status-errors-label">Issues</div>
+      <ul class="search-status-errors-list" id="errors-list"></ul>
+    </div>
   </div>
 
   <section class="panel">
@@ -66,26 +64,61 @@
           {% endif %}
         </p>
       </div>
-      {% if not browse %}
-      <div class="sort-toggle" role="group" aria-label="Sort results">
-        <button type="button" class="sort-btn is-active" data-sort="arrival" id="sort-arrival">
-          Arrival order
-        </button>
-        <button type="button" class="sort-btn" data-sort="date" id="sort-date">
-          Newest files
-        </button>
+      <div class="results-toolbar">
+        <label class="results-tool">
+          <span>Sort</span>
+          <select id="sort-select" aria-label="Sort results">
+            <option value="date" selected>Newest first</option>
+            <option value="date-asc">Oldest first</option>
+            <option value="size-desc">Largest files</option>
+            <option value="size-asc">Smallest files</option>
+            <option value="name">Name A–Z</option>
+            {% if not browse %}
+            <option value="sources">Most channels</option>
+            <option value="arrival">Arrival order</option>
+            {% endif %}
+          </select>
+        </label>
       </div>
-      {% endif %}
     </div>
-    {% if not browse %}
+    <div class="results-filters" id="results-filters">
+      <label class="results-tool">
+        <span>Name</span>
+        <input type="search" id="filter-name" placeholder="Filter filename…" autocomplete="off" />
+      </label>
+      <label class="results-tool">
+        <span>Ext</span>
+        <select id="filter-ext" aria-label="Filter by extension">
+          <option value="">All types</option>
+        </select>
+      </label>
+      {% if not browse %}
+      <label class="results-tool">
+        <span>Channel</span>
+        <input type="search" id="filter-channel" placeholder="@channel…" autocomplete="off" />
+      </label>
+      <label class="results-tool results-tool-check">
+        <input type="checkbox" id="filter-multi" />
+        <span>Multi-channel only</span>
+      </label>
+      {% endif %}
+      <label class="results-tool">
+        <span>Min size</span>
+        <select id="filter-min-size" aria-label="Minimum file size">
+          <option value="0">Any</option>
+          <option value="104857600">≥ 100 MB</option>
+          <option value="524288000">≥ 500 MB</option>
+          <option value="1073741824">≥ 1 GB</option>
+          <option value="2147483648">≥ 2 GB</option>
+          <option value="5368709120">≥ 5 GB</option>
+          <option value="10737418240">≥ 10 GB</option>
+        </select>
+      </label>
+      <span class="results-filter-count hint" id="filter-count"></span>
+    </div>
     <p class="hint" id="sort-hint" style="margin-bottom: 1rem">
-      New files append at the bottom as they are found.
+      {% if browse %}Showing newest posts first as files load.{% else %}Sorted by earliest channel post for each file (newest first).{% endif %}
     </p>
-    {% else %}
-    <p class="hint" id="sort-hint" style="margin-bottom: 1rem">
-      Showing newest posts first as files load.
-    </p>
-    {% endif %}
     <div class="results" id="results">
       <div class="empty" id="empty-state">
         {% if browse %}Loading files…{% else %}Searching… results will appear here as they are found.{% endif %}
@@ -127,21 +160,35 @@
 </dialog>
 
 <div class="download-dock" id="download-dock" hidden>
-  <div class="download-dock-head">
-    <strong>Downloads</strong>
-    <div class="download-dock-actions">
-      <a class="btn secondary btn-sm" href="/downloads">History</a>
-      <button type="button" class="btn secondary btn-sm" id="download-dock-clear">Clear done</button>
+  <button
+    type="button"
+    class="download-dock-tab"
+    id="download-dock-toggle"
+    title="Show or hide downloads"
+    aria-expanded="true"
+  >
+    <span class="download-dock-tab-label">Downloads</span>
+    <span class="download-dock-tab-count" id="download-dock-count" hidden>0</span>
+    <span class="download-dock-tab-chevron" aria-hidden="true">›</span>
+  </button>
+  <div class="download-dock-panel">
+    <div class="download-dock-head">
+      <strong>Downloads</strong>
+      <div class="download-dock-actions">
+        <a class="btn secondary btn-sm" href="/downloads">History</a>
+        <button type="button" class="btn secondary btn-sm" id="download-dock-clear">Clear done</button>
+        <button type="button" class="btn secondary btn-sm" id="download-dock-minimize" title="Minimize">Minimize</button>
+      </div>
     </div>
+    <div class="download-dock-list" id="download-dock-list"></div>
   </div>
-  <div class="download-dock-list" id="download-dock-list"></div>
 </div>
 
 <script>
   const BROWSE_MODE = {{ "true" if browse else "false" }};
   const DOWNLOAD_DIR = {{ (download_dir or "") | tojson }};
-  /** @type {"arrival"|"date"} */
-  let sortMode = BROWSE_MODE ? "date" : "arrival";
+  /** @type {string} */
+  let sortMode = "date";
   let arrivalSeq = 0;
   /** @type {Map<string, {data: object, el: HTMLElement, arrival: number}>} */
   const groups = new Map();
@@ -153,6 +200,19 @@
     date: BROWSE_MODE
       ? "Newest posts first."
       : "Sorted by earliest channel post for each file (newest first).",
+    "date-asc": "Oldest posts first.",
+    "size-desc": "Largest files first.",
+    "size-asc": "Smallest files first.",
+    name: "Alphabetical by filename.",
+    sources: "Files found in the most channels first.",
+  };
+
+  const filters = {
+    name: "",
+    ext: "",
+    channel: "",
+    multi: false,
+    minSize: 0,
   };
 
   function formatBytes(n) {
@@ -316,8 +376,13 @@
 
   function updateGroupEl(el, r) {
     const thumb = el.querySelector(".thumb");
-    if (r.thumb_url && thumb && !thumb.querySelector("img")) {
-      thumb.innerHTML = `<img src="${r.thumb_url}" alt="" loading="lazy" />`;
+    if (r.thumb_url && thumb) {
+      const img = thumb.querySelector("img");
+      if (!img) {
+        thumb.innerHTML = `<img src="${r.thumb_url}" alt="" loading="lazy" />`;
+      } else if (!img.getAttribute("src")) {
+        img.src = r.thumb_url;
+      }
     }
     const meta = el.querySelector(".meta");
     if (meta) meta.innerHTML = metaHtml(r);
@@ -341,18 +406,126 @@
 
   function sortedEntries() {
     const entries = [...groups.values()];
-    if (sortMode === "date") {
-      entries.sort((a, b) => {
-        const da = earliestSourceDate(a.data);
-        const db = earliestSourceDate(b.data);
-        const cmp = db.localeCompare(da);
-        if (cmp !== 0) return cmp;
-        return a.arrival - b.arrival;
-      });
-    } else {
-      entries.sort((a, b) => a.arrival - b.arrival);
-    }
+    entries.sort((a, b) => {
+      const ra = a.data;
+      const rb = b.data;
+      let cmp = 0;
+      if (sortMode === "date") {
+        cmp = earliestSourceDate(rb).localeCompare(earliestSourceDate(ra));
+      } else if (sortMode === "date-asc") {
+        cmp = earliestSourceDate(ra).localeCompare(earliestSourceDate(rb));
+      } else if (sortMode === "size-desc") {
+        cmp = (rb.file_size || 0) - (ra.file_size || 0);
+      } else if (sortMode === "size-asc") {
+        cmp = (ra.file_size || 0) - (rb.file_size || 0);
+      } else if (sortMode === "name") {
+        cmp = String(ra.file_name || "").localeCompare(String(rb.file_name || ""), undefined, {
+          sensitivity: "base",
+        });
+      } else if (sortMode === "sources") {
+        cmp = (rb.sources || []).length - (ra.sources || []).length;
+      } else {
+        cmp = a.arrival - b.arrival;
+      }
+      if (cmp !== 0) return cmp;
+      return a.arrival - b.arrival;
+    });
     return entries;
+  }
+
+  function resultExt(r) {
+    let ext = String(r.file_ext || "").toLowerCase().replace(/^\./, "");
+    if (!ext) {
+      const name = String(r.file_name || "");
+      const dot = name.lastIndexOf(".");
+      ext = dot >= 0 ? name.slice(dot + 1).toLowerCase() : "";
+    }
+    return ext;
+  }
+
+  function passesFilters(r) {
+    if (filters.name) {
+      const name = String(r.file_name || "").toLowerCase();
+      if (!name.includes(filters.name)) return false;
+    }
+    if (filters.ext) {
+      const want = filters.ext.toLowerCase().replace(/^\./, "");
+      if (resultExt(r) !== want) return false;
+    }
+    if (filters.minSize > 0 && Number(r.file_size || 0) < filters.minSize) return false;
+    if (filters.multi && (r.sources || []).length < 2) return false;
+    if (filters.channel) {
+      const needle = filters.channel.replace(/^@/, "").toLowerCase();
+      const sources = r.sources || [];
+      const hit =
+        sources.some((s) =>
+          String(s.channel_username || "").toLowerCase().includes(needle)
+        ) || String(r.channel_username || "").toLowerCase().includes(needle);
+      if (!hit) return false;
+    }
+    return true;
+  }
+
+  function refreshExtFilterOptions() {
+    const sel = document.getElementById("filter-ext");
+    if (!sel) return;
+    const prev = sel.value;
+    const exts = new Set();
+    for (const entry of groups.values()) {
+      const ext = resultExt(entry.data);
+      if (ext) exts.add(ext);
+    }
+    const sorted = [...exts].sort((a, b) => a.localeCompare(b));
+    const signature = sorted.join("|");
+    if (sel.dataset.extSig === signature) return;
+    sel.dataset.extSig = signature;
+    sel.innerHTML = `<option value="">All types</option>`;
+    for (const ext of sorted) {
+      const opt = document.createElement("option");
+      opt.value = `.${ext}`;
+      opt.textContent = `.${ext}`;
+      sel.appendChild(opt);
+    }
+    if (prev && sorted.includes(prev.replace(/^\./, ""))) {
+      sel.value = prev.startsWith(".") ? prev : `.${prev}`;
+    } else if (prev) {
+      sel.value = "";
+      filters.ext = "";
+    }
+  }
+
+  function applyFilters() {
+    let shown = 0;
+    for (const entry of groups.values()) {
+      const ok = passesFilters(entry.data);
+      entry.el.hidden = !ok;
+      entry.el.classList.toggle("is-filtered-out", !ok);
+      if (ok) shown += 1;
+    }
+    const countEl = document.getElementById("filter-count");
+    if (countEl) {
+      const total = groups.size;
+      const active =
+        filters.name ||
+        filters.ext ||
+        filters.channel ||
+        filters.multi ||
+        filters.minSize > 0;
+      countEl.textContent =
+        total && active ? `Showing ${shown} of ${total}` : total ? `${total} file(s)` : "";
+    }
+    const root = document.getElementById("results");
+    let emptyFilter = document.getElementById("empty-filter");
+    if (groups.size && shown === 0) {
+      if (!emptyFilter && root) {
+        root.insertAdjacentHTML(
+          "beforeend",
+          `<div class="empty" id="empty-filter">No files match these filters.</div>`
+        );
+      }
+    } else {
+      emptyFilter?.remove();
+    }
   }
 
   function applySortOrder() {
@@ -366,11 +539,13 @@
       desired.length === current.length &&
       desired.every((el, i) => el === current[i])
     ) {
+      applyFilters();
       return;
     }
     for (const entry of entries) {
       root.appendChild(entry.el);
     }
+    applyFilters();
   }
 
   function upsertResults(results) {
@@ -390,35 +565,44 @@
         if (!el) continue;
         groups.set(key, { data: r, el, arrival: arrivalSeq++, fp });
         flashCard(el, "new");
-        needReorder = sortMode === "date";
+        needReorder = sortMode !== "arrival";
         continue;
       }
       if (existing.fp === fp) {
         continue;
       }
-      const prevEarliest = earliestSourceDate(existing.data);
       existing.data = r;
       existing.fp = fp;
       updateGroupEl(existing.el, r);
       flashCard(existing.el, "update");
-      if (sortMode === "date" && earliestSourceDate(r) !== prevEarliest) {
+      if (sortMode !== "arrival") {
         needReorder = true;
       }
     }
 
     if (needReorder) {
       applySortOrder();
+    } else {
+      applyFilters();
     }
   }
 
   function setSortMode(mode) {
     sortMode = mode;
-    document.querySelectorAll(".sort-btn").forEach((btn) => {
-      btn.classList.toggle("is-active", btn.dataset.sort === mode);
-    });
+    const sel = document.getElementById("sort-select");
+    if (sel && sel.value !== mode) sel.value = mode;
     const hint = document.getElementById("sort-hint");
     if (hint) hint.textContent = SORT_HINTS[mode] || "";
     applySortOrder();
+  }
+
+  function readFiltersFromUi() {
+    filters.name = (document.getElementById("filter-name")?.value || "").trim().toLowerCase();
+    filters.ext = document.getElementById("filter-ext")?.value || "";
+    filters.channel = (document.getElementById("filter-channel")?.value || "").trim().toLowerCase();
+    filters.multi = !!document.getElementById("filter-multi")?.checked;
+    filters.minSize = Number(document.getElementById("filter-min-size")?.value || 0) || 0;
+    applyFilters();
   }
 
   async function tick() {
@@ -473,14 +657,40 @@
     }
     document.getElementById("progress-fill").style.width = `${fill}%`;
 
-    const err = document.getElementById("errors");
-    if (data.errors && data.errors.length) {
-      err.innerHTML = `<div class="error">${data.errors.map(escapeHtml).join("<br>")}</div>`;
-    } else {
-      err.innerHTML = "";
+    const variantPills = document.querySelectorAll("#status-variants .pill");
+    if (variantPills.length) {
+      const current = (data.current_variant || "").trim();
+      const scanned = Number(data.channels_scanned) || 0;
+      variantPills.forEach((pill, i) => {
+        const label = (pill.getAttribute("data-variant") || "").trim();
+        const isActive = !!data.running && !!current && label === current;
+        const isDone =
+          (!data.running && data.status === "done") ||
+          (!isActive && i < scanned);
+        pill.classList.toggle("is-active", isActive);
+        pill.classList.toggle("is-done", isDone);
+      });
+    }
+
+    const errBox = document.getElementById("errors");
+    const errList = document.getElementById("errors-list");
+    if (errBox && errList) {
+      const errs = data.errors || [];
+      if (errs.length) {
+        errBox.hidden = false;
+        errList.innerHTML = errs
+          .slice(-12)
+          .map((e) => `<li>${escapeHtml(e)}</li>`)
+          .join("");
+      } else {
+        errBox.hidden = true;
+        errList.innerHTML = "";
+      }
     }
 
     upsertResults(data.results || []);
+    refreshExtFilterOptions();
+    applyFilters();
 
     if (data.running) {
       setTimeout(tick, 600);
@@ -496,9 +706,16 @@
 
   tick();
 
-  document.querySelectorAll(".sort-btn").forEach((btn) => {
-    btn.addEventListener("click", () => setSortMode(btn.dataset.sort));
+  document.getElementById("sort-select")?.addEventListener("change", (ev) => {
+    setSortMode(ev.target.value);
   });
+  ["filter-name", "filter-channel"].forEach((id) => {
+    document.getElementById(id)?.addEventListener("input", readFiltersFromUi);
+  });
+  ["filter-ext", "filter-min-size"].forEach((id) => {
+    document.getElementById(id)?.addEventListener("change", readFiltersFromUi);
+  });
+  document.getElementById("filter-multi")?.addEventListener("change", readFiltersFromUi);
 
   document.getElementById("stop-search-btn")?.addEventListener("click", async () => {
     const btn = document.getElementById("stop-search-btn");
@@ -587,6 +804,25 @@
   function renderDock(jobs) {
     if (!dock || !dockList) return;
     const visible = jobs || [];
+    const countEl = document.getElementById("download-dock-count");
+    if (countEl) {
+      const activeCount = visible.filter(
+        (j) =>
+          j.status === "queued" ||
+          j.status === "running" ||
+          j.status === "needs_confirm"
+      ).length;
+      if (activeCount > 0) {
+        countEl.hidden = false;
+        countEl.textContent = String(activeCount);
+      } else if (visible.length) {
+        countEl.hidden = false;
+        countEl.textContent = String(visible.length);
+      } else {
+        countEl.hidden = true;
+        countEl.textContent = "0";
+      }
+    }
     if (!visible.length) {
       dock.hidden = true;
       dockList.innerHTML = "";
@@ -662,6 +898,29 @@
       }
     }
   }
+
+  function setDockCollapsed(collapsed) {
+    if (!dock) return;
+    dock.classList.toggle("is-collapsed", collapsed);
+    const toggle = document.getElementById("download-dock-toggle");
+    if (toggle) toggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    try {
+      localStorage.setItem("stl-download-dock-collapsed", collapsed ? "1" : "0");
+    } catch (e) {}
+  }
+
+  try {
+    if (localStorage.getItem("stl-download-dock-collapsed") === "1") {
+      setDockCollapsed(true);
+    }
+  } catch (e) {}
+
+  document.getElementById("download-dock-toggle")?.addEventListener("click", () => {
+    setDockCollapsed(!dock?.classList.contains("is-collapsed"));
+  });
+  document.getElementById("download-dock-minimize")?.addEventListener("click", () => {
+    setDockCollapsed(true);
+  });
 
   async function cancelDownload(jobId) {
     try {

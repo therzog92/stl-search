@@ -44,7 +44,7 @@ curl -fsSL https://raw.githubusercontent.com/therzog92/stl-search/main/install-s
 
 Log in with Telegram once. Downloads go to:
 
-`/volume1/docker/stl-search/downloads`
+`/volume1/NAS_Shared/Telegram STLs`
 
 ### Outside your house (like Jellyfin)
 DSM → **Login Portal / Reverse Proxy** → new rule:
@@ -60,9 +60,24 @@ Assign your Let's Encrypt certificate to that hostname (same workflow as Jellyfi
 
 ---
 
+## Moving from Windows → Synology
+
+If you already logged in on your PC, copy API keys + Telegram session (no re-login):
+
+```powershell
+.\sync-to-synology.ps1
+```
+
+Uses your OpenSSH host `synology-nas` (or set `-SshHost`). Transfers `.env`,
+`data/stl_search.session`, channel lists, and join log; pulls `:latest` and restarts.
+
+Don’t run the Windows app and the NAS container on the **same session file** at once.
+
+---
+
 ## Portainer / Dockge (paste stack)
 
-1. Create folders: `/volume1/docker/stl-search/data` and `.../downloads`
+1. Create folders: `/volume1/docker/stl-search/data` and `/volume1/NAS_Shared/Telegram STLs`
 2. Create `/volume1/docker/stl-search/.env` from [`.env.example`](.env.example)
 3. Paste [`docker-compose.synology.yml`](docker-compose.synology.yml) as a stack
 4. Deploy

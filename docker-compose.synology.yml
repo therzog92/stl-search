@@ -1,8 +1,10 @@
 # Marius-style Synology stack — pull a ready image (no build on the NAS).
-# Used by install-synology.sh
+# Used by install-synology.sh and sync-to-synology.ps1
 #
-# Before first start, create /volume1/docker/stl-search/.env from .env.example
-# (TELEGRAM_API_ID + TELEGRAM_API_HASH required).
+# Before first start, create /volume1/docker/stl-search/.env with:
+#   TELEGRAM_API_ID, TELEGRAM_API_HASH
+# Optional: TELEMETR_API_KEY
+# Or copy .env + data/*.session from your PC via sync-to-synology.ps1
 
 services:
   stl-search:
@@ -18,5 +20,7 @@ services:
       STL_PORT: "8787"
       STL_DOWNLOAD_DIR: "/downloads"
     volumes:
+      # Telegram session, discovered channels, join/mute log
       - /volume1/docker/stl-search/data:/app/data
-      - /volume1/docker/stl-search/downloads:/downloads
+      - "/volume1/NAS_Shared/Telegram STLs:/downloads"
+      - /volume1/docker/stl-search/channels.txt:/app/channels.txt:ro

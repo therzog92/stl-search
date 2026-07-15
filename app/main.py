@@ -15,17 +15,52 @@ from app.crypto_accel import install_tgcrypto_for_telethon
 install_tgcrypto_for_telethon()
 
 from app.catalog import has_api_key as telemetr_has_key
-from app.config import DOWNLOAD_DIR, MAX_AGE_DAYS, MIN_CHANNEL_MEMBERS, SESSION_PATH, THUMBS_DIR
+from app.config import DOWNLOAD_DIR, MAX_AGE_DAYS, MIN_CHANNEL_MEMBERS, THUMBS_DIR
+from app.settings_store import mask_secret
 from app.telegram_service import telegram_service
 from app.variants import generate_variants
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
-SESSION_FILE = Path(f"{SESSION_PATH}.session")
+
+_SOURCE_LABELS = {
+    "seed": "seed",
+    "catalog": "catalog",
+    "similar": "similar",
+    "linked": "linked",
+    "search": "search",
+    # How the channel was found during discovery — not Telegram membership
+    "joined": "from chats",
+    "discovered": "discovered",
+}
+
+
+def _source_label(source: str) -> str:
+    key = (source or "").strip().lower()
+    return _SOURCE_LABELS.get(key, source or "unknown")
+
+
+templates.env.filters["source_label"] = _source_label
+
+
+def _session_file() -> Path:
+    import app.config as cfg
+
+    return Path(f"{cfg.SESSION_PATH}.session")
 
 
 def _has_local_session() -> bool:
-    return SESSION_FILE.exists()
+    """True only if a session file exists and we are not forced logged-out."""
+    if getattr(telegram_service, "_logged_out", False):
+        return False
+    return _session_file().exists()
+
+
+async def _require_login():
+    """Redirect to login unless Telegram reports a real authorized session."""
+    if await telegram_service.is_authorized():
+        return None
+    return _auth_redirect()
 
 
 @asynccontextmanager
@@ -67,8 +102,7 @@ async def health():
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
-    # Prefer local session file so the page never waits on Telegram
-    if not _has_local_session() and not await telegram_service.is_authorized():
+    if not await telegram_service.is_authorized():
         return _auth_redirect()
 
     channels = telegram_service.get_channels_fast()
@@ -79,6 +113,9 @@ async def home(request: Request):
         [c for c in active if c.favorite],
         key=lambda c: (-(c.members or 0), c.username.casefold()),
     )
+    joined = telegram_service.known_joined_usernames()
+    joined_status = telegram_service.joined_status_map()
+    joined_lookup = {u: True for u in joined}
 
     discovery_error = telegram_service.discovery_error or telegram_service.discovery_state.error
     discovery_message = (
@@ -98,6 +135,9 @@ async def home(request: Request):
             "other_channels": other_channels,
             "favorite_channels": favorite_channels,
             "channels": channels,
+            "joined_usernames": sorted(joined),
+            "joined_lookup": joined_lookup,
+            "joined_status": joined_status,
             "min_members": MIN_CHANNEL_MEMBERS,
             "max_age_days": MAX_AGE_DAYS,
             "state": telegram_service.search_state,
@@ -113,7 +153,9 @@ async def home(request: Request):
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
-    if _has_local_session() or await telegram_service.is_authorized():
+    # Only skip login when Telegram actually authorizes the session —
+    # a leftover .session file after Log out must still show the login form.
+    if await telegram_service.is_authorized():
         return RedirectResponse("/", status_code=303)
     return templates.TemplateResponse(
         "login.html",
@@ -243,6 +285,9 @@ async def api_status():
         "browse_title": state.browse_title,
         "channels_scanned": state.channels_scanned,
         "channels_total": state.channels_total,
+        "current_channel": state.current_channel,
+        "current_variant": state.current_variant,
+        "step": state.step,
         "result_count": len(state.results),
         "source_count": source_count,
         "errors": state.errors,
@@ -259,6 +304,7 @@ async def api_discovery():
     return {
         "running": ds.running,
         "mode": ds.mode,
+        "phase": getattr(ds, "phase", "") or "",
         "progress": ds.progress,
         "error": ds.error or telegram_service.discovery_error,
         "message": ds.message or telegram_service.discovery_message,
@@ -493,6 +539,15 @@ async def download_local(channel: str, message_id: int):
     )
 
 
+@app.post("/channels/stop")
+async def stop_channels_job():
+    """Stop discover / refresh / deep crawl / enrich / join / leave."""
+    if not _has_local_session() and not await telegram_service.is_authorized():
+        return _auth_redirect()
+    stopped = telegram_service.request_stop_discovery()
+    return JSONResponse({"ok": True, "stopped": stopped})
+
+
 @app.post("/channels/refresh")
 async def refresh_channels():
     if not await telegram_service.is_authorized():
@@ -552,7 +607,7 @@ async def downloads_clear_history():
 
 @app.get("/manage", response_class=HTMLResponse)
 async def manage_channels(request: Request, saved: str | None = None, error: str | None = None):
-    if not _has_local_session() and not await telegram_service.is_authorized():
+    if not await telegram_service.is_authorized():
         return _auth_redirect()
     removed = telegram_service.remove_invalid_channels()
     all_channels = telegram_service.get_channels_fast()
@@ -584,6 +639,9 @@ async def manage_channels(request: Request, saved: str | None = None, error: str
     elif saved == "enrich":
         message = "Fetching members & descriptions in the background — this page will refresh when done."
     ds = telegram_service.discovery_state
+    enrich_running = ds.running and ds.mode == "enrich"
+    joined = telegram_service.known_joined_usernames()
+    unjoined_enabled = telegram_service.list_unjoined_channels(enabled_only=True)
     return templates.TemplateResponse(
         "manage.html",
         {
@@ -594,11 +652,96 @@ async def manage_channels(request: Request, saved: str | None = None, error: str
             "favorite_count": sum(1 for c in channels if c.favorite),
             "incomplete_count": incomplete,
             "min_members": MIN_CHANNEL_MEMBERS,
-            "message": message or (ds.message if ds.mode == "enrich" and not ds.running else None),
+            "joined_usernames": sorted(joined),
+            "joined_lookup": {u: True for u in joined},
+            "joined_status": telegram_service.joined_status_map(),
+            "unjoined_enabled_count": len(unjoined_enabled),
+            "joined_tracked_count": len(
+                telegram_service.list_joined_for_leave(only_joined_by_app=True)
+            ),
+            "message": message
+            or (ds.message if ds.mode == "enrich" and not ds.running else None),
             "error": error or (ds.error if ds.mode == "enrich" else None),
-            "enrich_running": ds.running and ds.mode == "enrich",
-            "enrich_progress": ds.progress if ds.mode == "enrich" else "",
+            "enrich_running": enrich_running,
+            "enrich_progress": ds.progress if enrich_running else "",
+            "job_running": enrich_running,
         },
+    )
+
+
+@app.get("/manage/export-unjoined")
+async def manage_export_unjoined(
+    enabled_only: str = "1",
+    fmt: str = "txt",
+):
+    """Download usernames not yet in the app join/mute log (for offline joining)."""
+    if not await telegram_service.is_authorized():
+        return _auth_redirect()
+    only_enabled = enabled_only not in {"0", "false", "no"}
+    channels = telegram_service.list_unjoined_channels(enabled_only=only_enabled)
+    fmt = (fmt or "txt").lower().strip()
+    if fmt == "csv":
+        lines = ["username,title,members,source,link"]
+        for c in channels:
+            title = (c.title or "").replace('"', "'")
+            lines.append(
+                f'{c.username},"{title}",{c.members or 0},{c.source},{c.link or f"https://t.me/{c.username}"}'
+            )
+        body = "\n".join(lines) + "\n"
+        media = "text/csv; charset=utf-8"
+        filename = "unjoined_channels.csv"
+    elif fmt == "html":
+        items: list[str] = []
+        for c in channels:
+            user = c.username
+            link = c.link or f"https://t.me/{user}"
+            web = f"https://web.telegram.org/k/#@{user}"
+            title = (c.title or user).replace("<", "").replace(">", "")
+            items.append(
+                "<li>"
+                f"<strong>{title}</strong> "
+                f"<span>@{user}</span> "
+                f'<a href="{link}" target="_blank" rel="noopener">Open in Telegram</a> · '
+                f'<a href="{web}" target="_blank" rel="noopener">Web</a>'
+                "</li>"
+            )
+        body = (
+            "<!DOCTYPE html><html><head><meta charset='utf-8'/>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1'/>"
+            "<title>Unjoined channels</title>"
+            "<style>body{font:16px/1.45 system-ui,sans-serif;max-width:42rem;margin:1.5rem auto;padding:0 1rem}"
+            "li{margin:0.65rem 0;padding:0.55rem 0;border-bottom:1px solid #ddd}"
+            "a{margin-right:0.35rem}</style></head><body>"
+            f"<h1>Join these channels ({len(channels)})</h1>"
+            "<p>Open each link in the Telegram app or website and tap Join. "
+            "When finished, run <strong>Join enabled (muted)</strong> in STL Search "
+            "Settings to mute them and update the log.</p>"
+            f"<ol>{''.join(items)}</ol></body></html>"
+        )
+        media = "text/html; charset=utf-8"
+        filename = "unjoined_channels.html"
+    elif fmt == "links":
+        body = "\n".join(
+            (c.link or f"https://t.me/{c.username}") for c in channels
+        ) + ("\n" if channels else "")
+        media = "text/plain; charset=utf-8"
+        filename = "unjoined_channel_links.txt"
+    else:
+        body = "\n".join(c.username for c in channels) + ("\n" if channels else "")
+        media = "text/plain; charset=utf-8"
+        filename = "unjoined_channels.txt"
+    from fastapi.responses import Response
+
+    headers = {"X-Unjoined-Count": str(len(channels))}
+    if fmt == "html":
+        headers["Content-Disposition"] = 'inline; filename="unjoined_channels.html"'
+    else:
+        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+
+    return Response(
+        content=body,
+        media_type=media,
+        headers=headers,
     )
 
 
@@ -615,6 +758,238 @@ async def manage_enrich():
         )
     asyncio.create_task(telegram_service.enrich_channel_details(only_incomplete=True))
     return RedirectResponse("/manage?saved=enrich", status_code=303)
+
+
+@app.post("/manage/join-muted")
+async def manage_join_muted(username: str = Form(...)):
+    """Join a single channel muted. Local joined badge uses the join log (no list sync)."""
+    if not await telegram_service.is_authorized():
+        return JSONResponse({"ok": False, "error": "Not logged in", "status": "error"}, status_code=401)
+    result = await telegram_service.join_channel_muted(username)
+    status_code = 200 if result.get("ok") else (
+        429 if result.get("status") == "rate_limit" else
+        409 if result.get("status") == "busy" else
+        400
+    )
+    return JSONResponse(result, status_code=status_code)
+
+
+@app.get("/settings", response_class=HTMLResponse)
+async def settings_page(
+    request: Request,
+    saved: str | None = None,
+    error: str | None = None,
+):
+    if not await telegram_service.is_authorized():
+        return _auth_redirect()
+
+    import app.config as cfg
+
+    ds = telegram_service.discovery_state
+    join_running = ds.running and ds.mode == "join_mute"
+    leave_running = ds.running and ds.mode == "leave"
+    web_join_running = ds.running and ds.mode == "join_web"
+    mute_sync_running = ds.running and ds.mode == "mute_sync"
+    job_running = join_running or leave_running or web_join_running or mute_sync_running
+
+    message = None
+    if saved == "join_mute":
+        message = "Muting / API-joining enabled channels — this page will refresh when done."
+    elif saved == "leave":
+        message = "Leaving app-joined channels — this page will refresh when done."
+    elif saved == "join_web":
+        message = (
+            "Telegram Web joiner started — a Chromium window should open. "
+            "Log in if asked, then click Continue on this page."
+        )
+    elif saved == "mute_sync":
+        message = "Refreshing mute status from Telegram…"
+    elif saved == "logout":
+        message = "Logged out. Sign in again when ready."
+    elif ds.message and ds.mode in {"join_mute", "leave", "join_web", "mute_sync"} and not ds.running:
+        message = ds.message
+
+    return templates.TemplateResponse(
+        "settings.html",
+        {
+            "request": request,
+            "message": message,
+            "error": error
+            or (ds.error if ds.mode in {"join_mute", "leave", "join_web", "mute_sync"} else None),
+            "api_id": cfg.API_ID or "",
+            "api_hash_masked": mask_secret(cfg.API_HASH),
+            "form_api_id": "",
+            "form_api_hash": "",
+            "joined_tracked_count": len(
+                telegram_service.list_joined_for_leave(only_joined_by_app=True)
+            ),
+            "unjoined_enabled_count": len(
+                telegram_service.list_unjoined_channels(enabled_only=True)
+            ),
+            "joined_unmuted_count": telegram_service.count_joined_unmuted(),
+            "job_running": job_running,
+            "job_progress": ds.progress if job_running else "",
+            "join_running": join_running,
+            "leave_running": leave_running,
+            "web_join_running": web_join_running,
+            "web_join_phase": ds.phase if web_join_running else "",
+            "mute_sync_running": mute_sync_running,
+            "search_running": telegram_service.search_state.running,
+        },
+    )
+
+
+@app.post("/settings/sync-mute")
+async def settings_sync_mute():
+    if not await telegram_service.is_authorized():
+        return _auth_redirect()
+    from urllib.parse import quote
+
+    if telegram_service.discovery_state.running:
+        return RedirectResponse(
+            f"/settings?error={quote('Another job is already running.')}",
+            status_code=303,
+        )
+    if telegram_service.search_state.running:
+        return RedirectResponse(
+            f"/settings?error={quote('Stop search first.')}",
+            status_code=303,
+        )
+    asyncio.create_task(telegram_service.refresh_mute_status_from_telegram())
+    return RedirectResponse("/settings?saved=mute_sync", status_code=303)
+
+
+@app.post("/settings/join-web/start")
+async def settings_join_web_start():
+    if not await telegram_service.is_authorized():
+        return _auth_redirect()
+    from urllib.parse import quote
+
+    result = telegram_service.start_join_via_telegram_web(delay_seconds=3.0)
+    if not result.get("ok"):
+        return RedirectResponse(
+            f"/settings?error={quote(result.get('error') or 'Could not start')}",
+            status_code=303,
+        )
+    return RedirectResponse("/settings?saved=join_web", status_code=303)
+
+
+@app.post("/settings/join-web/continue")
+async def settings_join_web_continue():
+    if not await telegram_service.is_authorized():
+        return _auth_redirect()
+    from urllib.parse import quote
+
+    if not telegram_service.confirm_web_join_login():
+        return RedirectResponse(
+            f"/settings?error={quote('No Telegram Web join waiting for Continue.')}",
+            status_code=303,
+        )
+    return RedirectResponse("/settings?saved=join_web", status_code=303)
+
+
+@app.post("/settings/join-muted")
+async def settings_join_muted():
+    if not _has_local_session() and not await telegram_service.is_authorized():
+        return _auth_redirect()
+    from urllib.parse import quote
+
+    if telegram_service.discovery_state.running:
+        return RedirectResponse(
+            f"/settings?error={quote('Already busy — wait for the current job to finish.')}",
+            status_code=303,
+        )
+    if telegram_service.search_state.running:
+        return RedirectResponse(
+            f"/settings?error={quote('Search is running — stop it before joining channels.')}",
+            status_code=303,
+        )
+    asyncio.create_task(telegram_service.join_enabled_channels_muted())
+    return RedirectResponse("/settings?saved=join_mute", status_code=303)
+
+
+@app.post("/settings/leave-joined")
+async def settings_leave_joined(confirm: str = Form("")):
+    if not _has_local_session() and not await telegram_service.is_authorized():
+        return _auth_redirect()
+    from urllib.parse import quote
+
+    if (confirm or "").strip() != "LEAVE":
+        return RedirectResponse(
+            f"/settings?error={quote('Type LEAVE (all caps) in the box to confirm leaving.')}",
+            status_code=303,
+        )
+    if telegram_service.discovery_state.running:
+        return RedirectResponse(
+            f"/settings?error={quote('Already busy — wait for the current job to finish.')}",
+            status_code=303,
+        )
+    if telegram_service.search_state.running:
+        return RedirectResponse(
+            f"/settings?error={quote('Search is running — stop it before leaving channels.')}",
+            status_code=303,
+        )
+    asyncio.create_task(telegram_service.leave_joined_channels_job(only_joined_by_app=True))
+    return RedirectResponse("/settings?saved=leave", status_code=303)
+
+
+@app.post("/settings/api-keys")
+async def settings_api_keys(
+    request: Request,
+    api_id: str = Form(...),
+    api_hash: str = Form(...),
+    channel_data: str = Form("transfer"),
+):
+    from urllib.parse import quote
+
+    import app.config as cfg
+
+    try:
+        new_id = int(str(api_id).strip())
+    except ValueError:
+        return RedirectResponse(
+            f"/settings?error={quote('API ID must be a number.')}",
+            status_code=303,
+        )
+    new_hash = (api_hash or "").strip()
+    transfer = (channel_data or "transfer").strip().lower() != "fresh"
+
+    result = await telegram_service.switch_telegram_api(
+        new_id,
+        new_hash,
+        transfer_channel_data=transfer,
+    )
+    if not result.get("ok"):
+        return templates.TemplateResponse(
+            "settings.html",
+            {
+                "request": request,
+                "message": None,
+                "error": result.get("error") or "Could not update API keys.",
+                "api_id": cfg.API_ID or "",
+                "api_hash_masked": mask_secret(cfg.API_HASH),
+                "form_api_id": str(api_id),
+                "form_api_hash": api_hash,
+                "joined_tracked_count": len(
+                    telegram_service.list_joined_for_leave(only_joined_by_app=True)
+                ),
+                "job_running": False,
+                "job_progress": "",
+                "join_running": False,
+                "leave_running": False,
+                "search_running": False,
+            },
+            status_code=400,
+        )
+
+    # Force re-auth with the new credentials
+    return RedirectResponse("/login", status_code=303)
+
+
+@app.post("/settings/logout")
+async def settings_logout():
+    await telegram_service.logout_telegram()
+    return RedirectResponse("/login", status_code=303)
 
 
 @app.post("/manage/ban")

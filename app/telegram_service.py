@@ -4,16 +4,28 @@ import asyncio
 import json
 import logging
 import re
+import threading
+import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError, ChannelPrivateError, UsernameNotOccupiedError
+from telethon.errors import (
+    FloodWaitError,
+    ChannelPrivateError,
+    UsernameNotOccupiedError,
+    UserAlreadyParticipantError,
+    InviteRequestSentError,
+    ChannelsTooMuchError,
+)
+from telethon.tl.functions.account import UpdateNotifySettingsRequest
 from telethon.tl.functions.channels import (
     GetChannelRecommendationsRequest,
     GetFullChannelRequest,
+    JoinChannelRequest,
+    LeaveChannelRequest,
 )
 from telethon.tl.functions.contacts import SearchRequest as ContactsSearchRequest
 from telethon.tl.types import (
@@ -22,6 +34,8 @@ from telethon.tl.types import (
     InputMessagesFilterDocument,
     InputMessagesFilterEmpty,
     InputMessagesFilterUrl,
+    InputNotifyPeer,
+    InputPeerNotifySettings,
     Message,
     MessageEntityTextUrl,
     MessageEntityUrl,
@@ -47,11 +61,18 @@ from app.config import (
     DOWNLOAD_HISTORY_FILE,
     DOWNLOAD_INDEX_FILE,
     DOWNLOAD_PART_KB,
+    DEEP_CRAWL_MAX_ROOTS,
+    DEEP_CRAWL_MAX_INSPECT,
     FILE_EXTENSIONS,
+    JOIN_DELAY_SECONDS,
+    JOIN_MAX_WAIT_SECONDS,
+    JOINED_CHANNELS_FILE,
     LINK_CRAWL_LIMIT,
     MAX_AGE_DAYS,
     MIN_CHANNEL_MEMBERS,
+    SEARCH_CONCURRENCY,
     SEARCH_DELAY_SECONDS,
+    SEARCH_VARIANT_DELAY,
     SESSION_PATH,
     THUMBS_DIR,
     load_seed_channels,
@@ -64,6 +85,16 @@ ProgressCb = Callable[[dict[str, Any]], Any]
 
 STL_HINT = re.compile(
     r"\b(stl|3mf|3d\s*print|printing|filament|resin|gcode|fdm)\b",
+    re.IGNORECASE,
+)
+# Skip channels that mention crypto / web3 in title, username, or about
+CRYPTO_HINT = re.compile(
+    r"\b("
+    r"crypto|cryptocurrency|cryptocurrencies|"
+    r"bitcoin|\bbtc\b|ethereum|\beth\b|"
+    r"blockchain|web3|\bnft\b|airdrop|defi|"
+    r"token\s*sale|altcoin|memecoin"
+    r")\b",
     re.IGNORECASE,
 )
 TME_USERNAME = re.compile(
@@ -135,6 +166,9 @@ class SearchState:
     results: list[dict] = field(default_factory=list)
     channels_scanned: int = 0
     channels_total: int = 0
+    current_channel: str = ""
+    current_variant: str = ""
+    step: str = ""
     errors: list[str] = field(default_factory=list)
     finished_at: str | None = None
 
@@ -142,10 +176,11 @@ class SearchState:
 @dataclass
 class DiscoveryState:
     running: bool = False
-    mode: str = ""  # catalog | deep | refresh
+    mode: str = ""  # catalog | deep | refresh | join_mute | leave | join_web
     progress: str = ""
     error: str | None = None
     message: str | None = None
+    phase: str = ""  # join_web: await_login | joining | …
 
 
 class TelegramService:
@@ -161,11 +196,17 @@ class TelegramService:
         self.discovery_error: str | None = None
         self.discovery_state = DiscoveryState()
         self._search_cancel_requested = False
+        self._discovery_cancel_requested = False
+        self._web_join_controller = None  # lazy WebJoinController
+        self._web_join_thread = None
+        self._preview_tasks: set[asyncio.Task] = set()
+        self._preview_sem = asyncio.Semaphore(3)
         self._download_lock = asyncio.Lock()
         self._download_jobs: dict[str, dict[str, Any]] = {}
         self._download_queue: asyncio.Queue[str] = asyncio.Queue()
         self._download_worker_task: asyncio.Task | None = None
         self._download_job_seq = 0
+        self._logged_out = False
 
     def request_stop_search(self) -> bool:
         """Signal the active search to stop after the current step."""
@@ -178,6 +219,120 @@ class TelegramService:
     def _search_stop_requested(self) -> bool:
         return self._search_cancel_requested
 
+    def request_stop_discovery(self) -> bool:
+        """Signal discover / refresh / enrich / join / leave / web-join to stop ASAP."""
+        if not self.discovery_state.running:
+            return False
+        self._discovery_cancel_requested = True
+        self.discovery_state.progress = "Stopping…"
+        ctrl = getattr(self, "_web_join_controller", None)
+        if ctrl is not None and self.discovery_state.mode == "join_web":
+            ctrl.stop.set()
+            ctrl.login_ready.set()  # unblock wait so the worker can exit
+        return True
+
+    def confirm_web_join_login(self) -> bool:
+        """User logged into Telegram Web — continue the auto-join worker."""
+        if not (
+            self.discovery_state.running and self.discovery_state.mode == "join_web"
+        ):
+            return False
+        ctrl = getattr(self, "_web_join_controller", None)
+        if ctrl is None:
+            return False
+        self.discovery_state.phase = "joining"
+        self.discovery_state.progress = "Starting joins…"
+        ctrl.login_ready.set()
+        return True
+
+    def start_join_via_telegram_web(self, *, delay_seconds: float = 3.0) -> dict[str, Any]:
+        """Open Telegram Web and auto-click Join (runs in a background thread)."""
+        if self.discovery_state.running:
+            return {"ok": False, "error": "Another job is already running."}
+        if self.search_state.running:
+            return {"ok": False, "error": "Stop search before auto-joining."}
+
+        from app.telegram_web_join import WebJoinController, load_progress, run_telegram_web_join
+
+        # Promote prior web-join successes into the join log so they drop off unjoined
+        try:
+            for name in load_progress().get("done") or []:
+                if name:
+                    self._record_joined(str(name), muted=False, already_member=False)
+        except Exception:
+            logger.exception("Could not sync web-join progress into join log")
+
+        targets = [c.username for c in self.list_unjoined_channels(enabled_only=True)]
+        if not targets:
+            return {"ok": False, "error": "No enabled unjoined channels to process."}
+
+        self._discovery_cancel_requested = False
+        ctrl = WebJoinController()
+        ctrl.reset()
+        self._web_join_controller = ctrl
+        self.discovery_state = DiscoveryState(
+            running=True,
+            mode="join_web",
+            phase="starting",
+            progress="Starting Telegram Web joiner…",
+        )
+
+        def worker() -> None:
+            def on_phase(phase: str, msg: str) -> None:
+                self.discovery_state.phase = phase
+                self.discovery_state.progress = msg
+                if phase == "error":
+                    self.discovery_state.error = msg
+                if phase == "done":
+                    self.discovery_state.message = msg
+                if phase == "stopped":
+                    self.discovery_state.message = msg
+
+            def on_joined(username: str, result: str) -> None:
+                # Persist so the next run (and Mute job) skip already-subscribed channels
+                try:
+                    self._record_joined(
+                        username,
+                        muted=False,
+                        already_member=(result == "already"),
+                    )
+                except Exception:
+                    logger.exception("Failed to record web-join @%s", username)
+
+            try:
+                run_telegram_web_join(
+                    targets,
+                    delay_seconds=delay_seconds,
+                    controller=ctrl,
+                    on_phase=on_phase,
+                    on_joined=on_joined,
+                )
+            except Exception as exc:
+                logger.exception("Telegram Web join failed")
+                self.discovery_state.error = str(exc)
+                self.discovery_state.phase = "error"
+                self.discovery_state.progress = "Error"
+            finally:
+                self.discovery_state.running = False
+                self._discovery_cancel_requested = False
+                if self.discovery_state.phase not in {
+                    "done",
+                    "stopped",
+                    "error",
+                }:
+                    self.discovery_state.phase = "done"
+                    if not self.discovery_state.progress:
+                        self.discovery_state.progress = "Done"
+
+        self._web_join_thread = threading.Thread(
+            target=worker, name="stl-web-join", daemon=True
+        )
+        self._web_join_thread.start()
+        return {"ok": True, "queued": len(targets)}
+
+    def _discovery_stop_requested(self) -> bool:
+        return self._discovery_cancel_requested
+
     async def connect(self) -> None:
         await self.client.connect()
 
@@ -186,18 +341,22 @@ class TelegramService:
 
     async def is_authorized(self) -> bool:
         """Fast auth check with timeout so the UI never hangs forever."""
-        session_file = Path(f"{SESSION_PATH}.session")
+        if getattr(self, "_logged_out", False):
+            return False
         try:
             if not self.client.is_connected():
                 await asyncio.wait_for(self.connect(), timeout=8)
-            return await asyncio.wait_for(self.client.is_user_authorized(), timeout=8)
-        except (asyncio.TimeoutError, OSError) as exc:
-            logger.warning("Auth check timed out: %s", exc)
-            # Don't bounce the user to login if we already have a session on disk
-            return session_file.exists()
+            authorized = bool(
+                await asyncio.wait_for(self.client.is_user_authorized(), timeout=8)
+            )
+            if authorized:
+                self._logged_out = False
+            return authorized
         except Exception as exc:
+            # Don't treat "session file exists" as logged-in. After an API key swap,
+            # a hollow session causes: The key is not registered in the system.
             logger.warning("Auth check failed: %s", exc)
-            return session_file.exists()
+            return False
 
     def get_channels_fast(self) -> list[ChannelInfo]:
         """Memory or disk cache — no Telegram calls. Safe for page renders."""
@@ -620,6 +779,7 @@ class TelegramService:
 
         if password:
             await self.client.sign_in(password=password)
+            self._logged_out = False
             return {"status": "authorized"}
 
         try:
@@ -630,6 +790,7 @@ class TelegramService:
             )
         except SessionPasswordNeededError:
             return {"status": "password_required", "message": "Two-factor password required."}
+        self._logged_out = False
         return {"status": "authorized"}
 
     async def resolve_channels(
@@ -661,11 +822,16 @@ class TelegramService:
         infos_by_key: dict[str, ChannelInfo] = {}
 
         mode = "deep" if deep_crawl else "catalog" if discover else "refresh"
+        self._discovery_cancel_requested = False
         self.discovery_state = DiscoveryState(running=True, mode=mode, progress="Loading seeds…")
+        stopped = False
 
         try:
             # 1) Seed list (Telegram inspect — small list)
             for idx, username in enumerate(seed_names.values(), start=1):
+                if self._discovery_stop_requested():
+                    stopped = True
+                    break
                 self.discovery_state.progress = f"Checking seed {idx}/{len(seed_names)}…"
                 info = await self._inspect_channel(username, source="seed")
                 infos_by_key[info.username.casefold()] = info
@@ -673,19 +839,20 @@ class TelegramService:
 
             # 2) Previously discovered — keep known member counts when possible
             prior_cache = {c.username.casefold(): c for c in self._load_channel_cache()}
-            for key, disc in discovered_map.items():
-                if key in infos_by_key:
-                    continue
-                cached = prior_cache.get(key)
-                best = disc
-                if cached and (cached.members or 0) > (disc.members or 0):
-                    best = cached
-                elif cached and (disc.members or 0) <= 0:
-                    best = cached
-                infos_by_key[key] = best
+            if not stopped:
+                for key, disc in discovered_map.items():
+                    if key in infos_by_key:
+                        continue
+                    cached = prior_cache.get(key)
+                    best = disc
+                    if cached and (cached.members or 0) > (disc.members or 0):
+                        best = cached
+                    elif cached and (disc.members or 0) <= 0:
+                        best = cached
+                    infos_by_key[key] = best
 
             # Refresh: re-inspect discovered channels missing members or description
-            if force and not discover and not deep_crawl:
+            if force and not discover and not deep_crawl and not stopped:
                 missing = [
                     c
                     for c in infos_by_key.values()
@@ -693,6 +860,9 @@ class TelegramService:
                     and ((c.members or 0) <= 0 or not (c.description or "").strip())
                 ]
                 for idx, channel in enumerate(missing, start=1):
+                    if self._discovery_stop_requested():
+                        stopped = True
+                        break
                     self.discovery_state.progress = (
                         f"Fetching details @{channel.username} ({idx}/{len(missing)})…"
                     )
@@ -709,7 +879,7 @@ class TelegramService:
                     await asyncio.sleep(0.2)
 
             # 3a) Fast path: Telemetr catalog — trust index member counts
-            if discover:
+            if discover and not stopped:
                 self.discovery_error = None
                 self.discovery_message = None
                 self.discovery_state.progress = "Querying Telemetr catalog…"
@@ -717,12 +887,17 @@ class TelegramService:
                     catalog_hits = await search_stl_channels()
                     added = 0
                     for hit in catalog_hits:
+                        if self._discovery_stop_requested():
+                            stopped = True
+                            break
                         key = hit.username.casefold()
                         if key in seed_names:
                             continue
                         if not self._is_valid_username(hit.username):
                             continue
                         if self._is_blacklisted(hit.username):
+                            continue
+                        if self._mentions_crypto(f"{hit.title} {hit.username}"):
                             continue
                         reason = (
                             "OK (Telemetr)"
@@ -746,27 +921,42 @@ class TelegramService:
                         infos_by_key[key] = self._preserve_user_enabled(prev, fresh)
                         if key not in prior_cache and key not in discovered_map:
                             added += 1
-                    self.discovery_message = (
-                        f"Catalog found {len(catalog_hits)} channel(s); "
-                        f"{added} newly added."
-                    )
-                    self.discovery_state.message = self.discovery_message
+                    if not stopped:
+                        self.discovery_message = (
+                            f"Catalog found {len(catalog_hits)} channel(s); "
+                            f"{added} newly added."
+                        )
+                        self.discovery_state.message = self.discovery_message
                 except CatalogError as exc:
                     self.discovery_error = str(exc)
                     self.discovery_state.error = str(exc)
                     logger.warning("Catalog discovery failed: %s", exc)
 
-            # 3b) Slow path: similar channels + t.me link snowball
-            if deep_crawl:
+            # 3b) Slow path: similar + t.me links from seeds AND discovered channels
+            if deep_crawl and not stopped:
                 self.discovery_error = None
-                self.discovery_state.progress = "Deep crawling seeds…"
-                seed_usernames = [
-                    c.username for c in infos_by_key.values() if c.source == "seed" and c.valid
-                ]
-                found = await self._discover_from_seeds(seed_usernames)
+                crawl_roots = self._deep_crawl_roots(infos_by_key)
+                self.discovery_state.progress = (
+                    f"Deep crawling {len(crawl_roots)} channel(s) "
+                    f"(seeds + discovered)…"
+                )
+                found, crawl_stopped = await self._discover_from_channels(crawl_roots)
+                if crawl_stopped:
+                    stopped = True
                 kept = 0
                 skipped = 0
-                for username, source in found:
+                inspect_budget = max(1, DEEP_CRAWL_MAX_INSPECT)
+                to_inspect = list(found.items())[:inspect_budget]
+                if len(found) > inspect_budget:
+                    self.discovery_state.progress = (
+                        f"Found {len(found)} candidates — inspecting first "
+                        f"{inspect_budget}…"
+                    )
+                for idx, (username, meta) in enumerate(to_inspect, start=1):
+                    if self._discovery_stop_requested():
+                        stopped = True
+                        break
+                    source = meta.get("source") if isinstance(meta, dict) else meta
                     key = username.casefold()
                     if key in infos_by_key or key in seed_names:
                         continue
@@ -776,27 +966,85 @@ class TelegramService:
                     if self._is_blacklisted(username):
                         skipped += 1
                         continue
-                    self.discovery_state.progress = f"Inspecting @{username}…"
-                    info = await self._inspect_channel(username, source=source)
-                    if not info.valid:
-                        skipped += 1
-                        await asyncio.sleep(0.1)
-                        continue
+                    title_hint = ""
+                    members_hint = 0
+                    if isinstance(meta, dict):
+                        title_hint = str(meta.get("title") or "")
+                        members_hint = int(meta.get("members") or 0)
+                        if self._mentions_crypto(f"{title_hint} {username}"):
+                            skipped += 1
+                            continue
+                    self.discovery_state.progress = (
+                        f"Inspecting @{username} ({idx}/{len(to_inspect)}; "
+                        f"kept {kept})…"
+                    )
+                    # Prefer lightweight accept from recommendation metadata;
+                    # only hit Telegram fully when we lack a usable title.
+                    if title_hint and not self._mentions_crypto(
+                        f"{title_hint} {username}"
+                    ):
+                        info = ChannelInfo(
+                            username=username,
+                            title=title_hint or username,
+                            members=members_hint,
+                            included=True,
+                            reason=(
+                                "OK (similar/linked)"
+                                if members_hint >= MIN_CHANNEL_MEMBERS
+                                else "From deep crawl (member count may be incomplete)"
+                            ),
+                            link=f"https://t.me/{username}",
+                            source=str(source or "similar"),
+                            description="",
+                            valid=True,
+                        )
+                    else:
+                        info = await self._inspect_channel(
+                            username, source=str(source or "similar")
+                        )
+                        if not info.valid:
+                            skipped += 1
+                            await asyncio.sleep(0.1)
+                            continue
+                        if self._mentions_crypto(
+                            f"{info.title} {info.username} {info.description}"
+                        ):
+                            skipped += 1
+                            continue
                     prev = prior_cache.get(key) or discovered_map.get(key)
                     if prev and prev.banned:
                         skipped += 1
                         continue
                     infos_by_key[key] = self._preserve_user_enabled(prev, info)
                     kept += 1
-                    await asyncio.sleep(0.15)
-                self.discovery_message = (
-                    f"Deep crawl finished — kept {kept} valid channel(s), skipped {skipped} invalid."
-                )
+                    # Persist as we go so Stop / crash doesn't lose work
+                    if kept % 8 == 0:
+                        self._save_discovered_channels(
+                            [
+                                c
+                                for c in infos_by_key.values()
+                                if c.source != "seed" and c.valid
+                            ]
+                        )
+                        self._save_channel_cache(list(infos_by_key.values()))
+                    await asyncio.sleep(0.08)
+                if stopped:
+                    self.discovery_message = (
+                        f"Stopped — kept {kept} new channel(s), skipped {skipped}. "
+                        "Progress saved."
+                    )
+                else:
+                    self.discovery_message = (
+                        f"Deep crawl finished — kept {kept} valid channel(s), "
+                        f"skipped {skipped} (invalid/crypto/blacklist"
+                        f"{'' if len(found) <= inspect_budget else f'; {len(found) - inspect_budget} not inspected yet — run again'})."
+                    )
                 self.discovery_state.message = self.discovery_message
 
-            if discover or deep_crawl or force:
-                await self._backfill_missing_members(infos_by_key)
-                # Drop anything invalid before save
+            if (discover or deep_crawl or force) and not stopped:
+                # Do NOT auto-backfill via Telegram here — it hammers ResolveUsername /
+                # GetFullChannel and trips FloodWait. Use Manage → "Load members &
+                # descriptions" when you explicitly want that.
                 infos_by_key = {
                     k: v
                     for k, v in infos_by_key.items()
@@ -806,6 +1054,11 @@ class TelegramService:
                 for key, prev in {**discovered_map, **prior_cache}.items():
                     if prev.banned and key not in infos_by_key and prev.valid:
                         infos_by_key[key] = prev
+                self._save_discovered_channels(
+                    [c for c in infos_by_key.values() if c.source != "seed" and c.valid]
+                )
+            elif stopped and infos_by_key:
+                # Persist partial progress so Stop doesn't throw away work
                 self._save_discovered_channels(
                     [c for c in infos_by_key.values() if c.source != "seed" and c.valid]
                 )
@@ -830,10 +1083,16 @@ class TelegramService:
             self._channel_cache = infos
             self._save_channel_cache(infos)
             self._save_blacklist(infos)
+            if stopped:
+                self.discovery_state.message = (
+                    self.discovery_state.message or "Stopped."
+                )
+                self.discovery_state.progress = "Stopped"
             return infos
         finally:
             self.discovery_state.running = False
-            if not self.discovery_state.progress.startswith("Done"):
+            self._discovery_cancel_requested = False
+            if not self.discovery_state.progress.startswith(("Done", "Stopped", "Error", "Paused")):
                 self.discovery_state.progress = "Done"
 
     async def _backfill_missing_members(self, infos_by_key: dict[str, ChannelInfo]) -> None:
@@ -846,6 +1105,9 @@ class TelegramService:
         if not missing:
             return
         for idx, channel in enumerate(missing, start=1):
+            if self._discovery_stop_requested():
+                self.discovery_state.progress = "Stopped"
+                return
             self.discovery_state.progress = (
                 f"Backfilling @{channel.username} ({idx}/{len(missing)})…"
             )
@@ -861,6 +1123,7 @@ class TelegramService:
         """Fetch members + description from Telegram for manage-page display."""
         if self.discovery_state.running:
             return
+        self._discovery_cancel_requested = False
         self.discovery_state = DiscoveryState(
             running=True, mode="enrich", progress="Preparing channel details…"
         )
@@ -884,7 +1147,11 @@ class TelegramService:
             by_key = {c.username.casefold(): c for c in channels}
             updated = 0
             removed = 0
+            stopped = False
             for idx, channel in enumerate(targets, start=1):
+                if self._discovery_stop_requested():
+                    stopped = True
+                    break
                 self.discovery_state.progress = (
                     f"Fetching details @{channel.username} ({idx}/{len(targets)})…"
                 )
@@ -904,18 +1171,832 @@ class TelegramService:
 
             merged = list(by_key.values())
             self._persist_channels(merged)
-            self.discovery_state.message = (
-                f"Updated {updated} channel(s)"
-                + (f", removed {removed} invalid" if removed else "")
-                + "."
-            )
-            self.discovery_state.progress = "Done"
+            if stopped:
+                self.discovery_state.message = (
+                    f"Stopped — updated {updated} channel(s)"
+                    + (f", removed {removed} invalid" if removed else "")
+                    + "."
+                )
+                self.discovery_state.progress = "Stopped"
+            else:
+                self.discovery_state.message = (
+                    f"Updated {updated} channel(s)"
+                    + (f", removed {removed} invalid" if removed else "")
+                    + "."
+                )
+                self.discovery_state.progress = "Done"
         except Exception as exc:
             logger.exception("enrich_channel_details failed")
             self.discovery_state.error = str(exc)
             self.discovery_state.progress = "Error"
         finally:
             self.discovery_state.running = False
+            self._discovery_cancel_requested = False
+
+    # Telegram treats this as "mute forever"
+    _MUTE_UNTIL_FOREVER = 2147483647
+
+    def _load_joined_log(self) -> dict[str, Any]:
+        if not JOINED_CHANNELS_FILE.exists():
+            return {"channels": []}
+        try:
+            data = json.loads(JOINED_CHANNELS_FILE.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return {"channels": []}
+            channels = data.get("channels")
+            if not isinstance(channels, list):
+                data["channels"] = []
+            return data
+        except Exception:
+            logger.exception("Failed reading joined channels log")
+            return {"channels": []}
+
+    def _save_joined_log(self, data: dict[str, Any]) -> None:
+        JOINED_CHANNELS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "channels": data.get("channels") or [],
+        }
+        JOINED_CHANNELS_FILE.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+    def _record_joined(self, username: str, *, muted: bool, already_member: bool) -> None:
+        name = (username or "").lstrip("@")
+        if not name:
+            return
+        data = self._load_joined_log()
+        rows: list[dict[str, Any]] = list(data.get("channels") or [])
+        key = name.casefold()
+        now = datetime.now(timezone.utc).isoformat()
+        existing = next((r for r in rows if str(r.get("username", "")).casefold() == key), None)
+        if existing:
+            existing["username"] = name
+            existing["muted"] = muted
+            existing["last_seen_at"] = now
+            if already_member:
+                existing["already_member"] = True
+            else:
+                existing["joined_at"] = existing.get("joined_at") or now
+                existing["joined_by_app"] = True
+        else:
+            rows.append(
+                {
+                    "username": name,
+                    "joined_at": now,
+                    "muted": muted,
+                    "joined_by_app": not already_member,
+                    "already_member": already_member,
+                    "last_seen_at": now,
+                }
+            )
+        data["channels"] = rows
+        self._save_joined_log(data)
+
+    def list_joined_for_leave(self, *, only_joined_by_app: bool = True) -> list[str]:
+        """Usernames to leave later. Default: only channels this app newly joined."""
+        data = self._load_joined_log()
+        names: list[str] = []
+        seen: set[str] = set()
+        for row in data.get("channels") or []:
+            name = str(row.get("username") or "").lstrip("@")
+            if not name:
+                continue
+            key = name.casefold()
+            if key in seen:
+                continue
+            if only_joined_by_app and not row.get("joined_by_app"):
+                continue
+            if not only_joined_by_app and not (row.get("joined_by_app") or row.get("muted")):
+                continue
+            seen.add(key)
+            names.append(name)
+        return names
+
+    def known_joined_usernames(self) -> set[str]:
+        """Casefolded usernames from the local join log (no Telegram API calls)."""
+        out: set[str] = set()
+        for row in self._load_joined_log().get("channels") or []:
+            name = str(row.get("username") or "").lstrip("@")
+            if not name:
+                continue
+            if row.get("muted") or row.get("joined_by_app") or row.get("already_member"):
+                out.add(name.casefold())
+        return out
+
+    def joined_status_map(self) -> dict[str, dict[str, bool]]:
+        """
+        casefold username -> {joined: True, muted: bool}.
+        muted reflects the log flag (refresh from Telegram to sync real notify settings).
+        """
+        out: dict[str, dict[str, bool]] = {}
+        for row in self._load_joined_log().get("channels") or []:
+            name = str(row.get("username") or "").lstrip("@")
+            if not name:
+                continue
+            if not (row.get("muted") or row.get("joined_by_app") or row.get("already_member")):
+                continue
+            out[name.casefold()] = {
+                "joined": True,
+                "muted": bool(row.get("muted")),
+            }
+        return out
+
+    def count_joined_unmuted(self) -> int:
+        return sum(1 for st in self.joined_status_map().values() if not st.get("muted"))
+
+    @staticmethod
+    def _notify_is_muted(mute_until: Any) -> bool:
+        """True if Telegram notify settings indicate the chat is muted."""
+        if mute_until is None:
+            return False
+        # Telethon may return unix int or datetime
+        if isinstance(mute_until, datetime):
+            ts = int(mute_until.timestamp())
+        else:
+            try:
+                ts = int(mute_until)
+            except (TypeError, ValueError):
+                return False
+        if ts <= 0:
+            return False
+        now = int(datetime.now(timezone.utc).timestamp())
+        return ts > now
+
+    async def refresh_mute_status_from_telegram(self) -> dict[str, Any]:
+        """
+        Walk dialogs and align join-log muted flags with Telegram notify settings.
+        Only updates channels already in the join log (or enabled catalog peers we find).
+        """
+        if self.discovery_state.running:
+            return {"ok": False, "error": "Another job is already running."}
+        if self.search_state.running:
+            return {"ok": False, "error": "Stop search first."}
+
+        self._discovery_cancel_requested = False
+        self.discovery_state = DiscoveryState(
+            running=True,
+            mode="mute_sync",
+            progress="Reading mute status from Telegram…",
+        )
+        updated = 0
+        checked = 0
+        unmuted = 0
+        muted = 0
+        try:
+            # username.casefold() -> muted bool from Telegram
+            live: dict[str, bool] = {}
+            async for dialog in self.client.iter_dialogs(limit=None):
+                if self._discovery_stop_requested():
+                    break
+                entity = dialog.entity
+                if not isinstance(entity, Channel):
+                    continue
+                username = getattr(entity, "username", None)
+                if not username:
+                    continue
+                ns = getattr(dialog.dialog, "notify_settings", None)
+                mute_until = getattr(ns, "mute_until", None) if ns else None
+                is_muted = self._notify_is_muted(mute_until)
+                live[username.casefold()] = is_muted
+                checked += 1
+                if checked % 40 == 0:
+                    self.discovery_state.progress = (
+                        f"Checked {checked} channels for mute status…"
+                    )
+
+            data = self._load_joined_log()
+            rows: list[dict[str, Any]] = list(data.get("channels") or [])
+            by_key = {
+                str(r.get("username", "")).lstrip("@").casefold(): r for r in rows if r.get("username")
+            }
+            now = datetime.now(timezone.utc).isoformat()
+
+            # Update existing join-log rows from live dialog mute state
+            for key, is_muted in live.items():
+                row = by_key.get(key)
+                if row is None:
+                    continue
+                if bool(row.get("muted")) != is_muted:
+                    row["muted"] = is_muted
+                    row["last_seen_at"] = now
+                    updated += 1
+                if is_muted:
+                    muted += 1
+                else:
+                    unmuted += 1
+
+            # Also recount join-log rows that weren't in dialogs (keep prior flag)
+            for row in rows:
+                key = str(row.get("username", "")).lstrip("@").casefold()
+                if key in live:
+                    continue
+                if row.get("muted"):
+                    muted += 1
+                elif row.get("joined_by_app") or row.get("already_member"):
+                    unmuted += 1
+
+            data["channels"] = rows
+            self._save_joined_log(data)
+            msg = (
+                f"Mute sync: checked {checked} Telegram chats, updated {updated} log "
+                f"entries — muted {muted}, unmuted {unmuted} in log."
+            )
+            self.discovery_state.message = msg
+            self.discovery_state.progress = "Done"
+            return {
+                "ok": True,
+                "checked": checked,
+                "updated": updated,
+                "muted": muted,
+                "unmuted": unmuted,
+                "message": msg,
+            }
+        except Exception as exc:
+            logger.exception("refresh_mute_status_from_telegram failed")
+            self.discovery_state.error = str(exc)
+            self.discovery_state.progress = "Error"
+            return {"ok": False, "error": str(exc)}
+        finally:
+            self.discovery_state.running = False
+            self._discovery_cancel_requested = False
+
+    def list_unjoined_channels(self, *, enabled_only: bool = True) -> list[ChannelInfo]:
+        """Enabled (or all) catalog channels not yet in the local mute/join log."""
+        joined = self.known_joined_usernames()
+        out: list[ChannelInfo] = []
+        for c in self.get_channels_fast():
+            if not c.valid or c.banned or not c.username:
+                continue
+            if enabled_only and not c.included:
+                continue
+            if c.username.casefold() in joined:
+                continue
+            out.append(c)
+        out.sort(key=lambda c: (-(c.members or 0), c.username.casefold()))
+        return out
+
+    async def _mute_peer_forever(self, entity: Any) -> None:
+        await self.client(
+            UpdateNotifySettingsRequest(
+                peer=InputNotifyPeer(peer=await self.client.get_input_entity(entity)),
+                settings=InputPeerNotifySettings(
+                    show_previews=False,
+                    silent=True,
+                    mute_until=self._MUTE_UNTIL_FOREVER,
+                ),
+            )
+        )
+
+    async def join_channel_muted(self, username: str) -> dict[str, Any]:
+        """Join one channel and mute forever. Uses local join log; one Telegram call."""
+        name = (username or "").lstrip("@").strip()
+        if not name:
+            return {"ok": False, "error": "Missing username", "status": "error"}
+        if self.discovery_state.running:
+            return {
+                "ok": False,
+                "error": "Another channel job is running — wait or stop it first.",
+                "status": "busy",
+                "username": name,
+            }
+        if self.search_state.running:
+            return {
+                "ok": False,
+                "error": "Search is running — stop it before joining.",
+                "status": "busy",
+                "username": name,
+            }
+        if name.casefold() in self.known_joined_usernames():
+            status = self.joined_status_map().get(name.casefold()) or {}
+            if status.get("muted"):
+                return {
+                    "ok": True,
+                    "username": name,
+                    "already_done": True,
+                    "status": "already",
+                }
+            # Already joined (e.g. web join) but not muted in our log — mute only
+            try:
+                entity = await self.client.get_entity(name)
+                await self._mute_peer_forever(entity)
+                self._record_joined(name, muted=True, already_member=True)
+                return {
+                    "ok": True,
+                    "username": name,
+                    "already_member": True,
+                    "already_done": False,
+                    "status": "muted",
+                }
+            except FloodWaitError as exc:
+                wait_s = int(getattr(exc, "seconds", 0) or 0)
+                return {
+                    "ok": False,
+                    "username": name,
+                    "status": "rate_limit",
+                    "error": f"Rate limited — wait {self._fmt_flood_wait(wait_s)} then try again.",
+                    "wait_seconds": wait_s,
+                }
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "username": name,
+                    "status": "error",
+                    "error": str(exc),
+                }
+        try:
+            entity = await self.client.get_entity(name)
+            already = False
+            try:
+                await self.client(JoinChannelRequest(entity))
+            except UserAlreadyParticipantError:
+                already = True
+            except InviteRequestSentError:
+                return {
+                    "ok": False,
+                    "username": name,
+                    "status": "approval",
+                    "error": "Join request sent (private channel) — wait for approval.",
+                }
+            await self._mute_peer_forever(entity)
+            self._record_joined(name, muted=True, already_member=already)
+            return {
+                "ok": True,
+                "username": name,
+                "already_member": already,
+                "already_done": False,
+                "status": "muted" if already else "joined",
+            }
+        except ChannelsTooMuchError:
+            return {
+                "ok": False,
+                "username": name,
+                "status": "error",
+                "error": "Telegram limit: too many channels joined on this account.",
+            }
+        except FloodWaitError as exc:
+            wait_s = int(getattr(exc, "seconds", 0) or 0)
+            return {
+                "ok": False,
+                "username": name,
+                "status": "rate_limit",
+                "error": f"Rate limited — wait {self._fmt_flood_wait(wait_s)} then try again.",
+                "wait_seconds": wait_s,
+            }
+        except Exception as exc:
+            logger.warning("join_channel_muted failed @%s: %s", name, exc)
+            return {
+                "ok": False,
+                "username": name,
+                "status": "error",
+                "error": str(exc),
+            }
+
+    async def join_enabled_channels_muted(self) -> None:
+        """Join every enabled Manage channel and mute notifications forever."""
+        if self.discovery_state.running:
+            return
+        self._discovery_cancel_requested = False
+        self.discovery_state = DiscoveryState(
+            running=True,
+            mode="join_mute",
+            progress="Preparing to join & mute…",
+        )
+        joined = 0
+        muted_only = 0
+        skipped = 0
+        already_done = 0
+        errors = 0
+        stopped_rate = False
+        try:
+            done_keys = {
+                str(row.get("username", "")).lstrip("@").casefold()
+                for row in (self._load_joined_log().get("channels") or [])
+                if row.get("username") and row.get("muted")
+            }
+            targets = [
+                c
+                for c in self.get_channels_fast()
+                if c.valid and c.included and not c.banned and c.username
+            ]
+            if not targets:
+                self.discovery_state.message = "No enabled channels to join."
+                self.discovery_state.progress = "Done"
+                return
+
+            pending = [c for c in targets if c.username.casefold() not in done_keys]
+            already_done = len(targets) - len(pending)
+            if already_done:
+                self.discovery_state.progress = (
+                    f"Skipping {already_done} already muted — "
+                    f"{len(pending)} left…"
+                )
+
+            if not pending:
+                self.discovery_state.message = (
+                    f"All {len(targets)} enabled channel(s) already joined/muted."
+                )
+                self.discovery_state.progress = "Done"
+                return
+
+            delay = max(0.5, JOIN_DELAY_SECONDS)
+            max_wait = max(15, JOIN_MAX_WAIT_SECONDS)
+            success_streak = 0
+
+            for idx, channel in enumerate(pending, start=1):
+                if self._discovery_stop_requested():
+                    stopped_rate = False
+                    self.discovery_state.message = (
+                        f"Stopped — joined {joined}, muted {muted_only}. "
+                        "Run Join again to continue."
+                    )
+                    self.discovery_state.progress = "Stopped"
+                    break
+                self.discovery_state.progress = (
+                    f"Join/mute @{channel.username} ({idx}/{len(pending)})…"
+                )
+                try:
+                    entity = await self.client.get_entity(channel.username)
+                    already = False
+                    try:
+                        await self.client(JoinChannelRequest(entity))
+                    except UserAlreadyParticipantError:
+                        already = True
+                    except InviteRequestSentError:
+                        skipped += 1
+                        self.discovery_state.progress = (
+                            f"@{channel.username}: join request sent (private)"
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+
+                    await self._mute_peer_forever(entity)
+                    self._record_joined(
+                        channel.username, muted=True, already_member=already
+                    )
+                    if already:
+                        muted_only += 1
+                    else:
+                        joined += 1
+                    success_streak += 1
+                except ChannelsTooMuchError:
+                    msg = "Telegram limit: too many channels joined on this account."
+                    self.discovery_state.error = msg
+                    self.discovery_state.progress = "Error"
+                    errors += 1
+                    break
+                except FloodWaitError as exc:
+                    wait_s = int(getattr(exc, "seconds", 0) or 0)
+                    pretty = self._fmt_flood_wait(wait_s)
+                    success_streak = 0
+                    if wait_s > max_wait:
+                        # Stop the batch — multi-hour waits aren't worth blocking the UI
+                        left = len(pending) - idx + 1
+                        msg = (
+                            f"Rate limited on @{channel.username} ({pretty}). "
+                            f"Stopped with {left} channel(s) left — run Join again later."
+                        )
+                        logger.warning(msg)
+                        self.discovery_state.error = msg
+                        self.discovery_state.progress = "Paused (rate limit)"
+                        stopped_rate = True
+                        errors += 1
+                        break
+                    self.discovery_state.progress = (
+                        f"Rate limited — waiting {pretty}, then continuing…"
+                    )
+                    await asyncio.sleep(wait_s + 2)
+                    # Extra cool-down after a flood wait so we don't re-trip immediately
+                    await asyncio.sleep(min(30.0, delay * 3))
+                    try:
+                        entity = await self.client.get_entity(channel.username)
+                        already = False
+                        try:
+                            await self.client(JoinChannelRequest(entity))
+                        except UserAlreadyParticipantError:
+                            already = True
+                        await self._mute_peer_forever(entity)
+                        self._record_joined(
+                            channel.username, muted=True, already_member=already
+                        )
+                        if already:
+                            muted_only += 1
+                        else:
+                            joined += 1
+                        success_streak += 1
+                    except FloodWaitError as again:
+                        wait2 = int(getattr(again, "seconds", 0) or 0)
+                        msg = (
+                            f"Rate limited again ({self._fmt_flood_wait(wait2)}). "
+                            "Stopped — run Join again later."
+                        )
+                        self.discovery_state.error = msg
+                        self.discovery_state.progress = "Paused (rate limit)"
+                        stopped_rate = True
+                        errors += 1
+                        break
+                    except Exception as inner:
+                        errors += 1
+                        logger.warning("Retry join/mute failed @%s: %s", channel.username, inner)
+                except Exception as exc:
+                    errors += 1
+                    logger.warning("Join/mute failed @%s: %s", channel.username, exc)
+                    self.discovery_state.progress = f"@{channel.username}: {exc}"
+
+                # Breather every 10 successes so we don't cliff into FloodWait as fast
+                if success_streak > 0 and success_streak % 10 == 0:
+                    self.discovery_state.progress = (
+                        f"Cooling down after {success_streak} joins…"
+                    )
+                    await asyncio.sleep(delay * 4)
+                else:
+                    await asyncio.sleep(delay)
+
+            if self.discovery_state.progress != "Stopped":
+                parts = [
+                    f"Joined {joined} new",
+                    f"muted {muted_only} already-member",
+                ]
+                if already_done:
+                    parts.append(f"skipped {already_done} already done")
+                if skipped:
+                    parts.append(f"{skipped} need approval")
+                if errors and not stopped_rate:
+                    parts.append(f"{errors} error(s)")
+                suffix = (
+                    " Run Join again later to continue."
+                    if stopped_rate
+                    else f" Tracked in {JOINED_CHANNELS_FILE.name}."
+                )
+                self.discovery_state.message = ", ".join(parts) + "." + suffix
+                if not self.discovery_state.error:
+                    self.discovery_state.progress = "Done"
+        except Exception as exc:
+            logger.exception("join_enabled_channels_muted failed")
+            self.discovery_state.error = str(exc)
+            self.discovery_state.progress = "Error"
+        finally:
+            self.discovery_state.running = False
+            self._discovery_cancel_requested = False
+
+    async def leave_tracked_channels(
+        self,
+        usernames: list[str] | None = None,
+        *,
+        only_joined_by_app: bool = True,
+    ) -> dict[str, Any]:
+        """Leave channels recorded in the join log (or an explicit list)."""
+        targets = (
+            usernames
+            if usernames is not None
+            else self.list_joined_for_leave(only_joined_by_app=only_joined_by_app)
+        )
+        left = 0
+        missing = 0
+        errors: list[str] = []
+        cleared: set[str] = set()
+
+        for idx, name in enumerate(targets, start=1):
+            username = name.lstrip("@")
+            key = username.casefold()
+            if self._discovery_stop_requested():
+                break
+            if self.discovery_state.running and self.discovery_state.mode == "leave":
+                self.discovery_state.progress = (
+                    f"Leaving @{username} ({idx}/{len(targets)})…"
+                )
+            try:
+                entity = await self.client.get_entity(username)
+                await self.client(LeaveChannelRequest(entity))
+                left += 1
+                cleared.add(key)
+            except (ChannelPrivateError, UsernameNotOccupiedError, ValueError) as exc:
+                missing += 1
+                cleared.add(key)
+                errors.append(f"@{username}: {exc}")
+            except FloodWaitError as exc:
+                wait_s = int(getattr(exc, "seconds", 0) or 0)
+                if wait_s > 90:
+                    errors.append(
+                        f"@{username}: rate limited ({self._fmt_flood_wait(wait_s)}) — stopped"
+                    )
+                    break
+                await asyncio.sleep(wait_s + 1)
+                try:
+                    entity = await self.client.get_entity(username)
+                    await self.client(LeaveChannelRequest(entity))
+                    left += 1
+                    cleared.add(key)
+                except Exception as inner:
+                    errors.append(f"@{username}: {inner}")
+            except Exception as exc:
+                msg = str(exc).lower()
+                if "not a participant" in msg or "left the channel" in msg:
+                    missing += 1
+                    cleared.add(key)
+                else:
+                    errors.append(f"@{username}: {exc}")
+            await asyncio.sleep(0.35)
+
+        log = self._load_joined_log()
+        remaining_rows = [
+            row
+            for row in (log.get("channels") or [])
+            if str(row.get("username", "")).lstrip("@").casefold() not in cleared
+        ]
+        self._save_joined_log({"channels": remaining_rows})
+        return {
+            "left": left,
+            "missing": missing,
+            "errors": errors,
+            "remaining": len(remaining_rows),
+        }
+
+    async def leave_joined_channels_job(self, *, only_joined_by_app: bool = True) -> None:
+        """Background leave using the Manage/Settings progress channel."""
+        if self.discovery_state.running:
+            return
+        targets = self.list_joined_for_leave(only_joined_by_app=only_joined_by_app)
+        self._discovery_cancel_requested = False
+        self.discovery_state = DiscoveryState(
+            running=True,
+            mode="leave",
+            progress="Preparing to leave channels…",
+        )
+        try:
+            if not targets:
+                self.discovery_state.message = (
+                    "No app-joined channels to leave "
+                    "(only newly joined ones are listed by default)."
+                )
+                self.discovery_state.progress = "Done"
+                return
+            result = await self.leave_tracked_channels(
+                targets, only_joined_by_app=only_joined_by_app
+            )
+            if self._discovery_stop_requested():
+                self.discovery_state.message = (
+                    f"Stopped — left {result['left']}. "
+                    f"{result['remaining']} still tracked."
+                )
+                self.discovery_state.progress = "Stopped"
+                return
+            parts = [f"Left {result['left']}"]
+            if result["missing"]:
+                parts.append(f"{result['missing']} already gone")
+            if result["remaining"]:
+                parts.append(f"{result['remaining']} still tracked")
+            if result["errors"]:
+                parts.append(f"{len(result['errors'])} error(s)")
+            self.discovery_state.message = "; ".join(parts) + "."
+            if result["errors"]:
+                self.discovery_state.error = "; ".join(result["errors"][:3])
+            self.discovery_state.progress = "Done"
+        except Exception as exc:
+            logger.exception("leave_joined_channels_job failed")
+            self.discovery_state.error = str(exc)
+            self.discovery_state.progress = "Error"
+        finally:
+            self.discovery_state.running = False
+            self._discovery_cancel_requested = False
+
+    def _session_paths(self) -> list[Path]:
+        import app.config as cfg
+
+        base = Path(str(cfg.SESSION_PATH))
+        return [
+            Path(f"{base}.session"),
+            Path(f"{base}.session-journal"),
+            Path(f"{base}.session.lock"),
+        ]
+
+    def clear_telegram_session_files(self) -> None:
+        for path in self._session_paths():
+            for _ in range(5):
+                try:
+                    path.unlink(missing_ok=True)
+                    break
+                except Exception:
+                    time.sleep(0.05)
+            if path.exists():
+                logger.warning("Could not remove session file %s", path)
+
+    def reset_channel_lists_fresh(self) -> None:
+        """Wipe discovered/manage cache/blacklist/joined; keep seed channels.txt."""
+        for path in (
+            DISCOVERED_FILE,
+            CHANNEL_CACHE_FILE,
+            BLACKLIST_FILE,
+            JOINED_CHANNELS_FILE,
+        ):
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                logger.warning("Could not remove %s", path)
+        self._channel_cache = None
+
+    def _new_telegram_client(self) -> TelegramClient:
+        import app.config as cfg
+
+        return TelegramClient(str(cfg.SESSION_PATH), cfg.API_ID, cfg.API_HASH)
+
+    async def logout_telegram(self) -> None:
+        """Log out this session and delete local session files."""
+        self._logged_out = True
+        try:
+            if self.client.is_connected():
+                try:
+                    # log_out() also drops the local session when it succeeds
+                    await self.client.log_out()
+                except Exception:
+                    try:
+                        await self.client.disconnect()
+                    except Exception:
+                        pass
+        except Exception:
+            logger.exception("logout_telegram disconnect failed")
+
+        # Recreate client so SQLite releases the .session file handle
+        try:
+            if self.client.is_connected():
+                await self.client.disconnect()
+        except Exception:
+            pass
+        self.client = self._new_telegram_client()
+        self.clear_telegram_session_files()
+        self._login_phone = None
+        self._phone_code_hash = None
+        self._channel_cache = None
+
+    async def switch_telegram_api(
+        self,
+        api_id: int,
+        api_hash: str,
+        *,
+        transfer_channel_data: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Swap Telegram API credentials in .env, drop the old session, and rebuild
+        the Telethon client. Channel lists can be kept (transfer) or wiped (fresh).
+        """
+        from app.settings_store import apply_telegram_api_to_runtime, update_env_values
+
+        if self.discovery_state.running or self.search_state.running:
+            return {
+                "ok": False,
+                "error": "Stop search / background jobs before swapping API keys.",
+            }
+
+        api_hash = (api_hash or "").strip()
+        if api_id <= 0 or not api_hash:
+            return {"ok": False, "error": "API ID and API hash are required."}
+
+        # Drop current MTProto session (bound to the previous api_id)
+        try:
+            if self.client.is_connected():
+                await self.client.disconnect()
+        except Exception:
+            pass
+        self.clear_telegram_session_files()
+
+        if transfer_channel_data:
+            # Old account memberships don't apply to the new login
+            try:
+                JOINED_CHANNELS_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
+        else:
+            self.reset_channel_lists_fresh()
+
+        update_env_values(
+            {
+                "TELEGRAM_API_ID": str(api_id),
+                "TELEGRAM_API_HASH": api_hash,
+            }
+        )
+        apply_telegram_api_to_runtime(api_id, api_hash)
+
+        import app.config as cfg
+
+        self.client = self._new_telegram_client()
+        self._login_phone = None
+        self._phone_code_hash = None
+        self._channel_cache = None
+        self._logged_out = True
+        try:
+            await self.connect()
+        except Exception as exc:
+            logger.warning("Reconnect after API swap failed (login next): %s", exc)
+
+        return {
+            "ok": True,
+            "transfer": transfer_channel_data,
+            "message": (
+                "API keys updated. Channel list transferred — log in with the new Telegram account."
+                if transfer_channel_data
+                else "API keys updated. Channel data reset — log in and rebuild your list."
+            ),
+        }
 
     def _load_discovered_channels(self) -> list[ChannelInfo]:
         if not DISCOVERED_FILE.exists():
@@ -1031,50 +2112,118 @@ class TelegramService:
             )
         self._save_discovered_channels(channels)
 
-    async def _discover_from_seeds(self, seed_usernames: list[str]) -> list[tuple[str, str]]:
-        """
-        Grow the list from seeds:
-        1) Telegram "Similar channels" for each seed
-        2) t.me links in each seed's description + recent posts
-        3) Keyword search + joined STL chats as a light fallback
-        """
-        found: dict[str, str] = {}  # username -> source
-        by_key: dict[str, str] = {}  # casefold -> username
-        priority = {"similar": 0, "linked": 1, "joined": 2, "search": 3}
-        seed_keys = {s.casefold() for s in seed_usernames}
+    @staticmethod
+    def _mentions_crypto(text: str) -> bool:
+        return bool(text and CRYPTO_HINT.search(text))
 
-        def add(username: str | None, source: str) -> None:
+    def _deep_crawl_roots(self, infos_by_key: dict[str, ChannelInfo]) -> list[str]:
+        """
+        Crawl roots: all seeds first, then other valid non-banned channels
+        (discovered/catalog/etc) by member count. Cap with DEEP_CRAWL_MAX_ROOTS.
+        """
+        seeds: list[str] = []
+        others: list[ChannelInfo] = []
+        for c in infos_by_key.values():
+            if not c.valid or not c.username or c.banned:
+                continue
+            if c.source == "seed":
+                seeds.append(c.username)
+            else:
+                others.append(c)
+        others.sort(key=lambda c: (-(c.members or 0), c.username.casefold()))
+        roots: list[str] = []
+        seen: set[str] = set()
+        for name in seeds + [c.username for c in others]:
+            key = name.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            roots.append(name)
+            if len(roots) >= max(1, DEEP_CRAWL_MAX_ROOTS):
+                break
+        return roots
+
+    async def _discover_from_channels(
+        self, root_usernames: list[str]
+    ) -> tuple[dict[str, dict[str, Any]], bool]:
+        """
+        Grow the list from crawl roots (seeds + discovered).
+        Returns (username -> {source, title, members}, stopped).
+        """
+        found: dict[str, dict[str, Any]] = {}
+        by_key: dict[str, str] = {}
+        priority = {"similar": 0, "linked": 1, "joined": 2, "search": 3}
+        root_keys = {s.casefold() for s in root_usernames}
+        stopped = False
+
+        def add(
+            username: str | None,
+            source: str,
+            *,
+            title: str = "",
+            members: int = 0,
+        ) -> None:
             if not username:
                 return
             username = username.lstrip("@")
             key = username.casefold()
-            if not username or key in TME_SKIP or key in seed_keys:
+            if not username or key in TME_SKIP or key in root_keys:
+                return
+            if self._mentions_crypto(f"{title} {username}"):
                 return
             existing_name = by_key.get(key)
+            meta = {
+                "source": source,
+                "title": (title or "").strip(),
+                "members": int(members or 0),
+            }
             if existing_name is None:
-                found[username] = source
+                found[username] = meta
                 by_key[key] = username
                 return
-            if priority[source] < priority.get(found[existing_name], 99):
+            if priority[source] < priority.get(found[existing_name].get("source", ""), 99):
                 del found[existing_name]
-                found[username] = source
+                found[username] = meta
                 by_key[key] = username
+            else:
+                # Keep better title/members if upgrading same source priority
+                cur = found[existing_name]
+                if not cur.get("title") and meta["title"]:
+                    cur["title"] = meta["title"]
+                if (cur.get("members") or 0) <= 0 and meta["members"]:
+                    cur["members"] = meta["members"]
 
-        for seed in seed_usernames:
-            # Official similar-channel recommendations (no join — public only)
+        total_roots = len(root_usernames)
+        for idx, seed in enumerate(root_usernames, start=1):
+            if self._discovery_stop_requested():
+                stopped = True
+                break
+            self.discovery_state.progress = (
+                f"Crawling @{seed} ({idx}/{total_roots}) — similar…"
+            )
             try:
                 entity = await self.client.get_entity(seed)
                 recs = await self.client(GetChannelRecommendationsRequest(channel=entity))
                 for chat in getattr(recs, "chats", []) or []:
                     if isinstance(chat, Channel) and getattr(chat, "username", None):
-                        add(chat.username, "similar")
+                        add(
+                            chat.username,
+                            "similar",
+                            title=getattr(chat, "title", "") or "",
+                            members=int(getattr(chat, "participants_count", 0) or 0),
+                        )
             except FloodWaitError as exc:
                 await asyncio.sleep(exc.seconds + 1)
             except Exception as exc:
                 logger.warning("Similar channels failed for @%s: %s", seed, exc)
             await asyncio.sleep(0.7)
 
-            # t.me links from about text + recent messages
+            if self._discovery_stop_requested():
+                stopped = True
+                break
+            self.discovery_state.progress = (
+                f"Crawling @{seed} ({idx}/{total_roots}) — links…"
+            )
             try:
                 for linked in await self._extract_tme_links_from_channel(seed):
                     add(linked, "linked")
@@ -1084,46 +2233,78 @@ class TelegramService:
                 logger.warning("Link crawl failed for @%s: %s", seed, exc)
             await asyncio.sleep(0.5)
 
-        # One extra hop: similar channels of the strongest new finds
-        hop_from = [u for u, s in found.items() if s == "similar"][:12]
+        hop_from = [
+            u for u, meta in found.items() if meta.get("source") == "similar"
+        ][:20]
         for username in hop_from:
+            if self._discovery_stop_requested():
+                stopped = True
+                break
             try:
                 entity = await self.client.get_entity(username)
                 recs = await self.client(GetChannelRecommendationsRequest(channel=entity))
                 for chat in getattr(recs, "chats", []) or []:
                     if isinstance(chat, Channel) and getattr(chat, "username", None):
-                        add(chat.username, "similar")
+                        add(
+                            chat.username,
+                            "similar",
+                            title=getattr(chat, "title", "") or "",
+                            members=int(getattr(chat, "participants_count", 0) or 0),
+                        )
             except Exception as exc:
                 logger.debug("Hop recommendations failed for @%s: %s", username, exc)
             await asyncio.sleep(0.7)
 
-        # Fallback: keyword search + already-joined STL dialogs
-        for query in DISCOVERY_QUERIES[:4]:
+        if not stopped:
+            for query in DISCOVERY_QUERIES[:4]:
+                if self._discovery_stop_requested():
+                    stopped = True
+                    break
+                try:
+                    result = await self.client(ContactsSearchRequest(q=query, limit=30))
+                    for chat in result.chats or []:
+                        if not isinstance(chat, Channel):
+                            continue
+                        username = getattr(chat, "username", None)
+                        title = (chat.title or "") + " " + (username or "")
+                        if (
+                            username
+                            and STL_HINT.search(title)
+                            and not self._mentions_crypto(title)
+                        ):
+                            add(
+                                username,
+                                "search",
+                                title=chat.title or "",
+                                members=int(getattr(chat, "participants_count", 0) or 0),
+                            )
+                except Exception as exc:
+                    logger.warning("Discovery search %r failed: %s", query, exc)
+                await asyncio.sleep(0.6)
+
+        if not stopped:
             try:
-                result = await self.client(ContactsSearchRequest(q=query, limit=30))
-                for chat in result.chats or []:
-                    if not isinstance(chat, Channel):
+                async for dialog in self.client.iter_dialogs(limit=300):
+                    entity = dialog.entity
+                    if not isinstance(entity, Channel):
                         continue
-                    username = getattr(chat, "username", None)
-                    title = (chat.title or "") + " " + (username or "")
-                    if username and STL_HINT.search(title):
-                        add(username, "search")
+                    username = getattr(entity, "username", None)
+                    blob = f"{dialog.name or ''} {username or ''}"
+                    if (
+                        username
+                        and STL_HINT.search(blob)
+                        and not self._mentions_crypto(blob)
+                    ):
+                        add(
+                            username,
+                            "joined",
+                            title=dialog.name or "",
+                            members=int(getattr(entity, "participants_count", 0) or 0),
+                        )
             except Exception as exc:
-                logger.warning("Discovery search %r failed: %s", query, exc)
-            await asyncio.sleep(0.6)
+                logger.warning("Dialog discovery failed: %s", exc)
 
-        try:
-            async for dialog in self.client.iter_dialogs(limit=300):
-                entity = dialog.entity
-                if not isinstance(entity, Channel):
-                    continue
-                username = getattr(entity, "username", None)
-                if username and STL_HINT.search(f"{dialog.name or ''} {username}"):
-                    add(username, "joined")
-        except Exception as exc:
-            logger.warning("Dialog discovery failed: %s", exc)
-
-        return list(found.items())
+        return found, stopped
 
     async def _extract_tme_links_from_channel(
         self, username: str, message_limit: int | None = None
@@ -1251,6 +2432,14 @@ class TelegramService:
             title = entity.title or public_username
             link = f"https://t.me/{public_username}"
 
+            # Don't pull crypto/web3 channels into the STL catalog (seeds still allowed)
+            if source != "seed" and self._mentions_crypto(
+                f"{title} {public_username} {description}"
+            ):
+                return self._invalid_channel(
+                    public_username, "Mentions crypto / web3 — skipped", source
+                )
+
             if members and members < MIN_CHANNEL_MEMBERS:
                 reason = f"Below {MIN_CHANNEL_MEMBERS:,} members (still usable)"
             elif members:
@@ -1283,6 +2472,17 @@ class TelegramService:
                 return self._invalid_channel(name, msg, source)
             return self._invalid_channel(name, f"Error: {exc}", source)
 
+    @staticmethod
+    def _fmt_flood_wait(seconds: int) -> str:
+        s = max(0, int(seconds))
+        if s < 60:
+            return f"{s}s"
+        if s < 3600:
+            return f"{s // 60}m {s % 60}s"
+        if s < 86400:
+            return f"{s // 3600}h {(s % 3600) // 60}m"
+        return f"{s // 86400}d {(s % 86400) // 3600}h"
+
     async def run_search(
         self,
         query: str,
@@ -1290,6 +2490,11 @@ class TelegramService:
         max_age_days: int = MAX_AGE_DAYS,
         per_channel_limit: int = 40,
     ) -> None:
+        """
+        Search via Telegram global search (like the official app), then keep
+        only hits from enabled Manage channels. Much fewer API calls than
+        iterating every channel with messages.search.
+        """
         async with self._search_lock:
             if self.search_state.running:
                 return
@@ -1300,73 +2505,169 @@ class TelegramService:
                 progress="Preparing…",
                 query=query,
                 mode="search",
+                step="preparing",
                 results=[],
             )
 
         seen_keys: set[str] = set()
         stopped = False
+        max_wait_seconds = 45
 
         try:
             active = [c for c in self.get_channels_fast() if c.included and not c.banned]
-            self.search_state.channels_total = len(active)
-            self.search_state.progress = f"Searching {len(active)} channel(s)…"
+            allowed = {c.username.casefold(): c for c in active if c.username}
             variants = generate_variants(query)
-            cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+            if not variants:
+                self.search_state.status = "done"
+                self.search_state.step = "done"
+                self.search_state.progress = "Empty query"
+                self.search_state.finished_at = datetime.now(timezone.utc).isoformat()
+                return
 
-            for idx, channel in enumerate(active, start=1):
+            self.search_state.channels_total = len(variants)
+            self.search_state.channels_scanned = 0
+            self.search_state.step = "searching"
+            self.search_state.progress = (
+                f"Global search across {len(allowed)} enabled channel(s)…"
+            )
+
+            cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+            msg_filter = (
+                InputMessagesFilterDocument() if files_only else InputMessagesFilterEmpty()
+            )
+            # Overall pull per variant (global), not per-channel
+            global_limit = max(80, per_channel_limit * 3)
+            chat_cache: dict[int, ChannelInfo | None] = {}
+            channels_hit: set[str] = set()
+
+            async def resolve_allowed_channel(message: Message) -> ChannelInfo | None:
+                chat = message.chat
+                if chat is None:
+                    try:
+                        chat = await message.get_chat()
+                    except Exception:
+                        return None
+                if not isinstance(chat, Channel):
+                    return None
+                cid = int(chat.id)
+                if cid in chat_cache:
+                    return chat_cache[cid]
+                uname = (getattr(chat, "username", None) or "").lstrip("@")
+                info = allowed.get(uname.casefold()) if uname else None
+                chat_cache[cid] = info
+                return info
+
+            for v_idx, variant in enumerate(variants, start=1):
                 if self._search_stop_requested():
                     stopped = True
                     break
 
-                self.search_state.channels_scanned = idx
-                self.search_state.progress = f"Searching @{channel.username} ({idx}/{len(active)})…"
+                self.search_state.current_variant = variant
+                self.search_state.current_channel = ""
+                self.search_state.step = "searching"
+                self.search_state.progress = (
+                    f"Global search “{variant}” ({v_idx}/{len(variants)})…"
+                )
+                self.search_state.channels_scanned = v_idx - 1
+
                 try:
-                    entity = await self.client.get_entity(channel.username)
-                    await self._search_channel(
-                        entity=entity,
-                        channel=channel,
-                        variants=variants,
-                        files_only=files_only,
-                        cutoff=cutoff,
-                        per_channel_limit=per_channel_limit,
-                        seen_keys=seen_keys,
-                    )
-                    if self._search_stop_requested():
-                        stopped = True
-                        break
+                    async for message in self.client.iter_messages(
+                        None,
+                        search=variant,
+                        filter=msg_filter,
+                        limit=global_limit,
+                    ):
+                        if self._search_stop_requested():
+                            stopped = True
+                            break
+                        if not isinstance(message, Message):
+                            continue
+                        if message.date:
+                            msg_date = message.date
+                            if msg_date.tzinfo is None:
+                                msg_date = msg_date.replace(tzinfo=timezone.utc)
+                            if msg_date < cutoff:
+                                # Global results aren't strictly date-sorted; don't break
+                                continue
+
+                        channel = await resolve_allowed_channel(message)
+                        if channel is None:
+                            continue
+
+                        if files_only and not self._has_wanted_file(message):
+                            if not message.document:
+                                continue
+                            if not self._document_matches_extensions(message):
+                                continue
+
+                        hit = await self._to_hit(
+                            message, channel, variant, defer_preview=True
+                        )
+                        if hit:
+                            self._append_search_result(hit, seen_keys)
+                            channels_hit.add(channel.username.casefold())
+                            self.search_state.progress = (
+                                f"Global “{variant}” ({v_idx}/{len(variants)}) · "
+                                f"{len(self.search_state.results)} file(s) · "
+                                f"{len(channels_hit)}/{len(allowed)} ch"
+                            )
                 except FloodWaitError as exc:
                     if self._search_stop_requested():
                         stopped = True
                         break
-                    msg = f"Rate limited on @{channel.username}: waiting {exc.seconds}s"
-                    logger.warning(msg)
-                    self.search_state.errors.append(msg)
-                    await asyncio.sleep(exc.seconds + 1)
+                    wait_s = int(getattr(exc, "seconds", 0) or 0)
+                    pretty = self._fmt_flood_wait(wait_s)
+                    if wait_s > max_wait_seconds:
+                        msg = (
+                            f"Rate limited on global search “{variant}”: "
+                            f"skipping term (Telegram asked for {pretty})"
+                        )
+                        logger.warning(msg)
+                        self.search_state.errors.append(msg)
+                        self.search_state.progress = f"Skipped “{variant}” (rate limit)"
+                    else:
+                        msg = f"Rate limited on global search: waiting {pretty}"
+                        logger.warning(msg)
+                        self.search_state.errors.append(msg)
+                        self.search_state.step = "waiting"
+                        self.search_state.progress = msg
+                        await asyncio.sleep(wait_s + 1)
                 except Exception as exc:
-                    msg = f"@{channel.username}: {exc}"
+                    msg = f"Global search “{variant}”: {exc}"
                     logger.exception(msg)
                     self.search_state.errors.append(msg)
 
-                if self._search_stop_requested():
+                self.search_state.channels_scanned = v_idx
+                if stopped or self._search_stop_requested():
                     stopped = True
                     break
-
-                await asyncio.sleep(SEARCH_DELAY_SECONDS)
+                if SEARCH_VARIANT_DELAY > 0:
+                    await asyncio.sleep(SEARCH_VARIANT_DELAY)
 
             self.search_state.results.sort(key=lambda r: r.get("date", ""), reverse=True)
-            if stopped:
+            self.search_state.current_channel = ""
+            self.search_state.current_variant = ""
+            n = len(self.search_state.results)
+            src = sum(len(g.get("sources") or []) for g in self.search_state.results)
+            hit_n = len(channels_hit)
+            if stopped or self._search_stop_requested():
                 self.search_state.status = "stopped"
-                n = len(self.search_state.results)
-                src = sum(len(g.get("sources") or []) for g in self.search_state.results)
-                self.search_state.progress = f"Stopped — {n} unique file(s) from {src} post(s)"
+                self.search_state.step = "stopped"
+                self.search_state.progress = (
+                    f"Stopped — {n} unique file(s) from {src} post(s) "
+                    f"in {hit_n} channel(s)"
+                )
             else:
                 self.search_state.status = "done"
-                n = len(self.search_state.results)
-                src = sum(len(g.get("sources") or []) for g in self.search_state.results)
-                self.search_state.progress = f"Found {n} unique file(s) from {src} post(s)"
+                self.search_state.step = "done"
+                self.search_state.progress = (
+                    f"Found {n} unique file(s) from {src} post(s) "
+                    f"in {hit_n}/{len(allowed)} enabled channel(s)"
+                )
             self.search_state.finished_at = datetime.now(timezone.utc).isoformat()
         except Exception as exc:
             self.search_state.status = "error"
+            self.search_state.step = "error"
             self.search_state.progress = str(exc)
             self.search_state.errors.append(str(exc))
         finally:
@@ -1405,6 +2706,8 @@ class TelegramService:
                 mode="browse",
                 browse_username=channel.username,
                 browse_title=channel.title or channel.username,
+                step="browsing",
+                current_channel=channel.username,
                 results=[],
                 channels_total=1,
             )
@@ -1564,6 +2867,9 @@ class TelegramService:
         cutoff: datetime,
         per_channel_limit: int,
         seen_keys: set[str],
+        seen_lock: asyncio.Lock | None = None,
+        progress_lock: asyncio.Lock | None = None,
+        defer_preview: bool = False,
     ) -> None:
         msg_filter = InputMessagesFilterDocument() if files_only else InputMessagesFilterEmpty()
         channel_seen: set[int] = set()
@@ -1571,6 +2877,13 @@ class TelegramService:
         for variant in variants:
             if self._search_stop_requested():
                 return
+            if progress_lock:
+                async with progress_lock:
+                    self.search_state.current_channel = channel.username
+                    self.search_state.current_variant = variant
+            else:
+                self.search_state.current_channel = channel.username
+                self.search_state.current_variant = variant
             try:
                 async for message in self.client.iter_messages(
                     entity,
@@ -1598,15 +2911,27 @@ class TelegramService:
                         if not self._document_matches_extensions(message):
                             continue
 
-                    hit = await self._to_hit(message, channel, variant)
+                    hit = await self._to_hit(
+                        message, channel, variant, defer_preview=defer_preview
+                    )
                     if hit:
                         channel_seen.add(message.id)
-                        self._append_search_result(hit, seen_keys)
+                        if seen_lock:
+                            async with seen_lock:
+                                self._append_search_result(hit, seen_keys)
+                        else:
+                            self._append_search_result(hit, seen_keys)
             except FloodWaitError:
                 raise
             except Exception as exc:
-                self.search_state.errors.append(f"@{channel.username} / '{variant}': {exc}")
-            await asyncio.sleep(0.4)
+                err = f"@{channel.username} / '{variant}': {exc}"
+                if progress_lock:
+                    async with progress_lock:
+                        self.search_state.errors.append(err)
+                else:
+                    self.search_state.errors.append(err)
+            if SEARCH_VARIANT_DELAY > 0:
+                await asyncio.sleep(SEARCH_VARIANT_DELAY)
 
     def _has_wanted_file(self, message: Message) -> bool:
         return self._document_matches_extensions(message)
@@ -1628,7 +2953,40 @@ class TelegramService:
     def _file_ext(self, file_name: str) -> str:
         return Path(file_name).suffix.lower()
 
-    async def _to_hit(self, message: Message, channel: ChannelInfo, variant: str) -> SearchHit | None:
+    def _thumb_disk_path(self, channel_username: str, message_id: int) -> Path:
+        return THUMBS_DIR / f"{channel_username}_{message_id}.jpg"
+
+    def _schedule_preview_enrich(
+        self, message: Message, channel: ChannelInfo, group_key: str
+    ) -> None:
+        """Fetch missing thumbs in the background so search isn't blocked."""
+
+        async def _run() -> None:
+            async with self._preview_sem:
+                if self._group_has_thumb(group_key):
+                    return
+                path = await self._save_preview(message, channel.username)
+                if not path:
+                    return
+                thumb_url = f"/thumbs/{path.name}"
+                idx = self._group_index(group_key)
+                if idx is not None and not self.search_state.results[idx].get("thumb_url"):
+                    self.search_state.results[idx]["thumb_url"] = thumb_url
+
+        try:
+            task = asyncio.create_task(_run())
+        except RuntimeError:
+            return
+        self._preview_tasks.add(task)
+        task.add_done_callback(self._preview_tasks.discard)
+
+    async def _to_hit(
+        self,
+        message: Message,
+        channel: ChannelInfo,
+        variant: str,
+        defer_preview: bool = False,
+    ) -> SearchHit | None:
         file_name = self._file_name(message)
         text = (message.message or message.text or "").strip()
         if not file_name and not text:
@@ -1640,9 +2998,15 @@ class TelegramService:
         # Skip slow preview fetch when we already have this file + a thumb
         thumb_url = None
         if not self._group_has_thumb(group_key):
-            thumb_path = await self._save_preview(message, channel.username)
-            if thumb_path:
-                thumb_url = f"/thumbs/{thumb_path.name}"
+            disk = self._thumb_disk_path(channel.username, message.id)
+            if disk.exists() and disk.stat().st_size > 0:
+                thumb_url = f"/thumbs/{disk.name}"
+            elif defer_preview:
+                self._schedule_preview_enrich(message, channel, group_key)
+            else:
+                thumb_path = await self._save_preview(message, channel.username)
+                if thumb_path:
+                    thumb_url = f"/thumbs/{thumb_path.name}"
 
         username = channel.username
         link = f"https://t.me/{username}/{message.id}"

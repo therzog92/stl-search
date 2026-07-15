@@ -21,7 +21,7 @@ services:
     volumes:
       # Keep Telegram login + channel lists + download history
       - ./data:/app/data
-      # Your STL download destination on the NAS (CHANGE THIS PATH)
-      - /volume1/docker/stl-search/downloads:/downloads
+      # Your STL download destination on the NAS
+      - "/volume1/NAS_Shared/Telegram STLs:/downloads"
     # Optional: give container a stable hostname on your LAN
     # hostname: stl-search
