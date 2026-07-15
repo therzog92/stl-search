@@ -7,3 +7,4 @@ telethon==1.39.0
 tgcrypto==1.2.5
 aiofiles==24.1.0
 httpx==0.28.1
+tzdata==2025.2

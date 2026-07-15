@@ -11,6 +11,37 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+_DISPLAY_TZ = None
+
+
+def _central_tz():
+    """America/Chicago when tzdata is available; else fixed UTC-6 labeled CST."""
+    global _DISPLAY_TZ
+    if _DISPLAY_TZ is not None:
+        return _DISPLAY_TZ
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo("America/Chicago")
+        # Force load so missing tzdata fails here, not mid-request
+        datetime.now(timezone.utc).astimezone(tz)
+        _DISPLAY_TZ = tz
+    except Exception:
+        _DISPLAY_TZ = timezone(timedelta(hours=-6), name="CST")
+    return _DISPLAY_TZ
+
+
+def _format_result_date(dt: datetime) -> str:
+    """MM-DD-YYYY h:mm AM/PM CST for result cards."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    local = dt.astimezone(_central_tz())
+    text = local.strftime("%m-%d-%Y %I:%M %p CST")
+    # "07-15-2026 01:30 PM CST" -> "07-15-2026 1:30 PM CST"
+    if len(text) > 11 and text[11] == "0":
+        text = text[:11] + text[12:]
+    return text
+
 from telethon import TelegramClient
 from telethon.errors import (
     FloodWaitError,
@@ -3012,7 +3043,7 @@ class TelegramService:
         link = f"https://t.me/{username}/{message.id}"
         date = ""
         if message.date:
-            date = message.date.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            date = _format_result_date(message.date)
 
         return SearchHit(
             channel_username=username,
