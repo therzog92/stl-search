@@ -109,7 +109,7 @@ from app.config import (
     THUMBS_DIR,
     load_seed_channels,
 )
-from app.variants import generate_variants
+from app.variants import build_search_plan, generate_variants
 
 logger = logging.getLogger(__name__)
 
@@ -2547,15 +2547,15 @@ class TelegramService:
         try:
             active = [c for c in self.get_channels_fast() if c.included and not c.banned]
             allowed = {c.username.casefold(): c for c in active if c.username}
-            variants = generate_variants(query)
-            if not variants:
+            plan = build_search_plan(query)
+            if not plan:
                 self.search_state.status = "done"
                 self.search_state.step = "done"
                 self.search_state.progress = "Empty query"
                 self.search_state.finished_at = datetime.now(timezone.utc).isoformat()
                 return
 
-            self.search_state.channels_total = len(variants)
+            self.search_state.channels_total = len(plan)
             self.search_state.channels_scanned = 0
             self.search_state.step = "searching"
             self.search_state.progress = (
@@ -2588,23 +2588,30 @@ class TelegramService:
                 chat_cache[cid] = info
                 return info
 
-            for v_idx, variant in enumerate(variants, start=1):
+            for v_idx, variant in enumerate(plan, start=1):
                 if self._search_stop_requested():
                     stopped = True
                     break
 
-                self.search_state.current_variant = variant
+                tg_q = variant.telegram_query
+                self.search_state.current_variant = variant.label
                 self.search_state.current_channel = ""
                 self.search_state.step = "searching"
-                self.search_state.progress = (
-                    f"Global search “{variant}” ({v_idx}/{len(variants)})…"
-                )
+                if variant.match_re is not None and variant.label != tg_q:
+                    self.search_state.progress = (
+                        f"Global search “{variant.label}” via “{tg_q}” "
+                        f"({v_idx}/{len(plan)})…"
+                    )
+                else:
+                    self.search_state.progress = (
+                        f"Global search “{variant.label}” ({v_idx}/{len(plan)})…"
+                    )
                 self.search_state.channels_scanned = v_idx - 1
 
                 try:
                     async for message in self.client.iter_messages(
                         None,
-                        search=variant,
+                        search=tg_q,
                         filter=msg_filter,
                         limit=global_limit,
                     ):
@@ -2631,14 +2638,21 @@ class TelegramService:
                             if not self._document_matches_extensions(message):
                                 continue
 
+                        file_name = self._file_name(message)
+                        text = (message.message or message.text or "").strip()
+                        # Wildcard terms (gojo*life) only keep matching hits;
+                        # a separate OR line like "gojo" can still match alone.
+                        if not variant.matches_text(file_name, text):
+                            continue
+
                         hit = await self._to_hit(
-                            message, channel, variant, defer_preview=True
+                            message, channel, variant.label, defer_preview=True
                         )
                         if hit:
                             self._append_search_result(hit, seen_keys)
                             channels_hit.add(channel.username.casefold())
                             self.search_state.progress = (
-                                f"Global “{variant}” ({v_idx}/{len(variants)}) · "
+                                f"Global “{variant.label}” ({v_idx}/{len(plan)}) · "
                                 f"{len(self.search_state.results)} file(s) · "
                                 f"{len(channels_hit)}/{len(allowed)} ch"
                             )
@@ -2650,12 +2664,14 @@ class TelegramService:
                     pretty = self._fmt_flood_wait(wait_s)
                     if wait_s > max_wait_seconds:
                         msg = (
-                            f"Rate limited on global search “{variant}”: "
+                            f"Rate limited on global search “{variant.label}”: "
                             f"skipping term (Telegram asked for {pretty})"
                         )
                         logger.warning(msg)
                         self.search_state.errors.append(msg)
-                        self.search_state.progress = f"Skipped “{variant}” (rate limit)"
+                        self.search_state.progress = (
+                            f"Skipped “{variant.label}” (rate limit)"
+                        )
                     else:
                         msg = f"Rate limited on global search: waiting {pretty}"
                         logger.warning(msg)
@@ -2664,7 +2680,7 @@ class TelegramService:
                         self.search_state.progress = msg
                         await asyncio.sleep(wait_s + 1)
                 except Exception as exc:
-                    msg = f"Global search “{variant}”: {exc}"
+                    msg = f"Global search “{variant.label}”: {exc}"
                     logger.exception(msg)
                     self.search_state.errors.append(msg)
 

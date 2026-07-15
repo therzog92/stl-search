@@ -100,9 +100,10 @@
         <span>Only STL / 3MF / ZIP (and RAR / 7Z) file posts</span>
       </label>
       <p class="hint">
-        Separate terms with <code>|</code> or <code>OR</code> (or new lines) to search all in one run.
-        Each term still expands variants (spaces / hyphens / glued). More terms = longer search.
-        Member floor: {{ "{:,}".format(min_members) }}.
+        Separate terms with <code>|</code> or <code>OR</code> (or new lines) — each is independent.
+        Spacing variants still expand (spaces / hyphens / glued). Use <code>*</code> as a wildcard
+        (<code>name*part</code> matches text with anything in between); only those hits show for that term.
+        More terms = longer search. Member floor: {{ "{:,}".format(min_members) }}.
       </p>
     </form>
   </section>
