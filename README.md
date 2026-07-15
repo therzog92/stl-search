@@ -91,9 +91,8 @@ If you already logged in on your PC, copy API keys + Telegram session (no re-log
 Uses your OpenSSH host `synology-nas` (or set `-SshHost`). Transfers `.env`,
 `data/stl_search.session`, channel lists, and join log; pulls `:latest` and restarts.
 
-Don’t run the Windows app and the NAS container on the **same session file** at once.
-Remote HTTPS via the gateway (`:8788`) will prefer Windows when it’s up — quit the
-Windows app if you need the NAS instance to own Telegram.
+The NAS stack puts Telegram in standby while Windows is healthy so both don’t
+hold the same session at once. Opening Home also stops discover/join jobs.
 
 ---
 
