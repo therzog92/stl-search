@@ -21,6 +21,7 @@ from app.config import (
     MIN_CHANNEL_MEMBERS,
     STL_HOSTNAME,
     STL_INSTANCE,
+    STL_PEER_HEALTH_URL,
     THUMBS_DIR,
 )
 from app.settings_store import mask_secret
@@ -72,16 +73,107 @@ async def _require_login():
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # Never resume a previous discover/join job after a restart
     try:
-        await asyncio.wait_for(telegram_service.connect(), timeout=15)
+        telegram_service.request_stop_discovery()
+        telegram_service.discovery_state.running = False
+        telegram_service.discovery_state.progress = ""
+        telegram_service._discovery_cancel_requested = False
     except Exception:
-        # App still serves UI/cache even if Telegram is slow at boot
         pass
+
+    peer_task: asyncio.Task | None = None
+
+    async def _peer_standby_loop() -> None:
+        """NAS: disconnect Telegram while Windows is healthy (same session)."""
+        import httpx
+
+        url = STL_PEER_HEALTH_URL
+        if not url:
+            return
+        if not url.endswith("/health"):
+            url = f"{url.rstrip('/')}/health"
+        logger = __import__("logging").getLogger("stl.standby")
+        while True:
+            peer_ok = False
+            try:
+                async with httpx.AsyncClient(timeout=2.5) as client:
+                    resp = await client.get(url)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        inst = (data.get("instance") or "").lower()
+                        # Only stand by for a healthy Windows peer
+                        peer_ok = bool(data.get("ok", True)) and inst in (
+                            "windows",
+                            "",
+                        )
+            except Exception:
+                peer_ok = False
+
+            if peer_ok:
+                if not telegram_service.telegram_standby:
+                    logger.info("Peer Windows healthy — Telegram standby on")
+                telegram_service.enter_telegram_standby()
+                try:
+                    await telegram_service.disconnect()
+                except Exception:
+                    pass
+            else:
+                if telegram_service.telegram_standby:
+                    logger.info("Peer Windows down — leaving Telegram standby")
+                telegram_service.leave_telegram_standby()
+                try:
+                    if not telegram_service.client.is_connected():
+                        await asyncio.wait_for(telegram_service.connect(), timeout=15)
+                except Exception:
+                    pass
+            await asyncio.sleep(5)
+
+    # Connect unless we're immediately going into peer standby
+    skip_connect = False
+    if STL_PEER_HEALTH_URL and STL_INSTANCE == "synology":
+        # Quick probe — if Windows is up, never connect this process
+        try:
+            import httpx
+
+            probe = STL_PEER_HEALTH_URL
+            if not probe.endswith("/health"):
+                probe = f"{probe.rstrip('/')}/health"
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                resp = await client.get(probe)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if (data.get("instance") or "").lower() == "windows" or data.get(
+                        "ok"
+                    ):
+                        if (data.get("instance") or "windows").lower() == "windows":
+                            telegram_service.enter_telegram_standby()
+                            skip_connect = True
+        except Exception:
+            pass
+
+    if not skip_connect:
+        try:
+            await asyncio.wait_for(telegram_service.connect(), timeout=15)
+        except Exception:
+            # App still serves UI/cache even if Telegram is slow at boot
+            pass
     try:
         telegram_service.cleanup_incomplete_downloads()
     except Exception:
         pass
+
+    if STL_PEER_HEALTH_URL and STL_INSTANCE == "synology":
+        peer_task = asyncio.create_task(_peer_standby_loop())
+
     yield
+
+    if peer_task:
+        peer_task.cancel()
+        try:
+            await peer_task
+        except asyncio.CancelledError:
+            pass
     try:
         # Drop any in-progress partials before shutdown
         telegram_service.cleanup_incomplete_downloads()
@@ -115,11 +207,16 @@ async def health():
         "hostname": STL_HOSTNAME,
         "download_dir": str(DOWNLOAD_DIR),
         "download_label": download_label,
+        "telegram_standby": telegram_service.telegram_standby,
+        "telegram_connected": bool(telegram_service.client.is_connected()),
     }
 
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
+    # Opening the app should never leave a discover/join job running
+    telegram_service.request_stop_discovery()
+
     if not await telegram_service.is_authorized():
         return _auth_redirect()
 

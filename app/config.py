@@ -23,19 +23,22 @@ DOWNLOAD_CACHE_DIR = ROOT / "data" / "downloads"
 _default_dl = Path(r"C:\Users\Tommy\Documents\3D Files\Telegram  Unorganized")
 DOWNLOAD_DIR = Path(os.getenv("STL_DOWNLOAD_DIR", str(_default_dl))).expanduser()
 # Parallel connections inside one file download (Telegram max part size 512 KB).
-# Keep low when multiple files download at once — a global budget (~12) is shared.
-DOWNLOAD_CONNECTIONS = int(os.getenv("STL_DOWNLOAD_CONNECTIONS", "4"))
+# Keep low when multiple files download at once — a global budget is shared.
+DOWNLOAD_CONNECTIONS = int(os.getenv("STL_DOWNLOAD_CONNECTIONS", "3"))
 DOWNLOAD_PART_KB = int(os.getenv("STL_DOWNLOAD_PART_KB", "512"))
 # How many separate file downloads can run at once (queue still accepts more)
-DOWNLOAD_JOB_CONCURRENCY = int(os.getenv("STL_DOWNLOAD_JOB_CONCURRENCY", "4"))
+DOWNLOAD_JOB_CONCURRENCY = int(os.getenv("STL_DOWNLOAD_JOB_CONCURRENCY", "2"))
 # Hard cap on simultaneous media TCP streams across ALL downloads
-DOWNLOAD_CONN_BUDGET = int(os.getenv("STL_DOWNLOAD_CONN_BUDGET", "12"))
+DOWNLOAD_CONN_BUDGET = int(os.getenv("STL_DOWNLOAD_CONN_BUDGET", "8"))
 
 # Which deployment this process is (shown in UI badge / used by gateway)
 STL_INSTANCE = (os.getenv("STL_INSTANCE") or "windows").strip().lower()
 STL_HOSTNAME = (os.getenv("STL_HOSTNAME") or "").strip() or (
     "synology" if STL_INSTANCE == "synology" else "windows"
 )
+# Synology: while this Windows health URL is OK, disconnect Telegram so both
+# machines don't hold the same session (major FloodWait source).
+STL_PEER_HEALTH_URL = (os.getenv("STL_PEER_HEALTH_URL") or "").strip().rstrip("/")
 
 DISCOVERY_QUERIES = (
     "stl",

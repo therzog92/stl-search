@@ -71,7 +71,10 @@ Give the PC a DHCP reservation so that IP stays stable. Allow Windows Firewall T
 
 > Do **not** port-forward `8787` to the internet. Use HTTPS reverse proxy (or Tailscale).
 
-**Telegram session:** don’t leave Windows STL Search and the NAS app both connected on the same session. For remote PC downloads, leave the Windows app running; quit it before relying on the NAS Telegram client.
+**Telegram session:** Windows and the NAS must not both stay connected. With the
+gateway stack, the NAS puts Telegram in **standby** while your PC’s `/health`
+answers (see `STL_PEER_HEALTH_URL`). Opening the home page also stops any
+running discover/join job.
 
 The UI header shows **Windows · PC folder** or **Synology · NAS folder** for whichever backend answered.
 

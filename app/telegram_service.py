@@ -93,6 +93,7 @@ from app.config import (
     DOWNLOAD_INDEX_FILE,
     DOWNLOAD_JOB_CONCURRENCY,
     DOWNLOAD_PART_KB,
+    DOWNLOAD_CONN_BUDGET,
     DEEP_CRAWL_MAX_ROOTS,
     DEEP_CRAWL_MAX_INSPECT,
     FILE_EXTENSIONS,
@@ -238,6 +239,21 @@ class TelegramService:
         self._download_worker_tasks: list[asyncio.Task] = []
         self._download_job_seq = 0
         self._logged_out = False
+        # When True, do not reconnect to Telegram (peer Windows is primary)
+        self._telegram_standby = False
+
+    def enter_telegram_standby(self) -> None:
+        """Stop background API jobs; peer loop will disconnect the client."""
+        self._telegram_standby = True
+        self.request_stop_discovery()
+        self.request_stop_search()
+
+    def leave_telegram_standby(self) -> None:
+        self._telegram_standby = False
+
+    @property
+    def telegram_standby(self) -> bool:
+        return bool(self._telegram_standby)
 
     def request_stop_search(self) -> bool:
         """Signal the active search to stop after the current step."""
@@ -365,15 +381,25 @@ class TelegramService:
         return self._discovery_cancel_requested
 
     async def connect(self) -> None:
+        if self._telegram_standby:
+            return
         await self.client.connect()
 
     async def disconnect(self) -> None:
-        await self.client.disconnect()
+        try:
+            if self.client.is_connected():
+                await self.client.disconnect()
+        except Exception:
+            pass
 
     async def is_authorized(self) -> bool:
         """Fast auth check with timeout so the UI never hangs forever."""
         if getattr(self, "_logged_out", False):
             return False
+        # Standby (Windows is primary): don't reconnect — pretend logged-in if
+        # a session file exists so /health and UI shell keep working.
+        if self._telegram_standby:
+            return Path(f"{SESSION_PATH}.session").exists()
         try:
             if not self.client.is_connected():
                 await asyncio.wait_for(self.connect(), timeout=8)
@@ -3811,8 +3837,9 @@ class TelegramService:
             self._delete_download_artifact(partial)
             try:
                 # Share media connections across concurrent jobs (avoid DC stalls).
-                jobs_n = max(1, min(8, int(DOWNLOAD_JOB_CONCURRENCY or 4)))
-                per_file = max(2, min(int(DOWNLOAD_CONNECTIONS or 4), max(2, 12 // jobs_n)))
+                jobs_n = max(1, min(8, int(DOWNLOAD_JOB_CONCURRENCY or 2)))
+                budget = max(2, int(DOWNLOAD_CONN_BUDGET or 8))
+                per_file = max(1, min(int(DOWNLOAD_CONNECTIONS or 3), max(1, budget // jobs_n)))
                 path = await parallel_download_to_path(
                     self.client,
                     message.document,

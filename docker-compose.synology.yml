@@ -26,6 +26,8 @@ services:
       STL_DOWNLOAD_DIR: "/downloads"
       STL_INSTANCE: "synology"
       STL_HOSTNAME: "synology"
+      # While Windows answers, disconnect Telegram on NAS (shared session)
+      STL_PEER_HEALTH_URL: "${STL_WINDOWS_UPSTREAM:-http://192.168.0.88:8787}/health"
     volumes:
       # Telegram session, discovered channels, join/mute log
       - /volume1/docker/stl-search/data:/app/data
