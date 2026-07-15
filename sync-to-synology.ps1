@@ -75,8 +75,9 @@ sudo docker compose -f "`$DIR/docker-compose.yml" up -d --force-recreate
 
 sleep 3
 sudo docker ps --filter name=stl- --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
-curl -fsS -m 8 -o /dev/null -w 'nas:%{http_code}\n' http://127.0.0.1:8787/health || echo 'nas:wait'
-curl -fsS -m 8 -o /dev/null -w 'gateway:%{http_code}\n' http://127.0.0.1:8788/_gateway/status || echo 'gateway:wait'
+curl -fsS -m 8 -o /dev/null -w 'gateway:%{http_code}\n' http://127.0.0.1:8787/_gateway/status || echo 'gateway:wait'
+curl -fsS -m 8 http://127.0.0.1:8787/health || true
+echo ''
 echo 'DONE'
 "@
 
@@ -92,7 +93,6 @@ Write-Host ""
 ssh -t $SshHost "chmod +x '$RemoteDir/finish-deploy.sh' && bash '$RemoteDir/finish-deploy.sh'"
 
 Write-Host ""
-Write-Host "Open http://192.168.0.165:8787  (NAS direct)"
-Write-Host "     http://192.168.0.165:8788  (gateway — Windows first)"
-Write-Host "Reverse proxy should target localhost:8788 for remote HTTPS."
+Write-Host "Open http://192.168.0.165:8787  (gateway → Windows if up, else NAS)"
+Write-Host "Reverse proxy: localhost:8787 (unchanged destination)"
 Write-Host ""

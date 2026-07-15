@@ -48,15 +48,16 @@ Log in with Telegram once. Downloads go to:
 
 ### Outside your house (like Jellyfin)
 
-Use the **gateway** so remote HTTPS prefers your Windows PC (PC-folder downloads)
-and falls back to the NAS container when the PC is offline.
+Use the **gateway** (published on NAS port **8787**) so remote HTTPS prefers your
+Windows PC (PC-folder downloads) and falls back to the NAS container when the PC
+is offline.
 
-DSM → **Login Portal / Reverse Proxy** → new rule:
+DSM → **Login Portal / Reverse Proxy** → rule:
 
 | | |
 |---|---|
 | Source | `https://stl.yourdomain.com` port `443` |
-| Destination | `http://localhost` port **`8788`** (gateway) |
+| Destination | `http://localhost` port **`8787`** |
 
 Assign your Let's Encrypt certificate to that hostname (same workflow as Jellyfin).
 
@@ -68,7 +69,7 @@ STL_WINDOWS_UPSTREAM=http://192.168.0.88:8787
 
 Give the PC a DHCP reservation so that IP stays stable. Allow Windows Firewall TCP **8787** from the NAS (see `install-windows-firewall.ps1`).
 
-> Do **not** port-forward `8787`/`8788` to the internet. Use HTTPS reverse proxy (or Tailscale).
+> Do **not** port-forward `8787` to the internet. Use HTTPS reverse proxy (or Tailscale).
 
 **Telegram session:** don’t leave Windows STL Search and the NAS app both connected on the same session. For remote PC downloads, leave the Windows app running; quit it before relying on the NAS Telegram client.
 

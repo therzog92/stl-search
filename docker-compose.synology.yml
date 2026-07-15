@@ -6,8 +6,8 @@
 # Optional: TELEMETR_API_KEY
 # Or copy .env + data/*.session from your PC via sync-to-synology.ps1
 #
-# Gateway (port 8788): prefers Windows PC STL Search when healthy, else this NAS.
-# Point DSM Reverse Proxy at localhost:8788 (not :8787) for remote HTTPS access.
+# Port 8787 is the failover GATEWAY (prefers Windows PC, else NAS app).
+# DSM Reverse Proxy can stay on localhost:8787 — no change needed.
 # Reserve / fix your PC LAN IP, or set STL_WINDOWS_UPSTREAM in .env.
 
 services:
@@ -15,9 +15,9 @@ services:
     image: ghcr.io/therzog92/stl-search:latest
     container_name: stl-search
     restart: unless-stopped
-    # LAN can still hit the NAS app directly; remote HTTPS should use the gateway.
-    ports:
-      - "8787:8787"
+    # Internal only — public traffic goes through stl-gateway on host :8787
+    expose:
+      - "8787"
     env_file:
       - .env
     environment:
@@ -39,7 +39,8 @@ services:
     depends_on:
       - stl-search
     ports:
-      - "8788:8788"
+      # Same port your reverse proxy already uses
+      - "8787:8788"
     environment:
       # Override in /volume1/docker/stl-search/.env if your PC IP changes
       STL_WINDOWS_UPSTREAM: "${STL_WINDOWS_UPSTREAM:-http://192.168.0.88:8787}"
