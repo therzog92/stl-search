@@ -1,6 +1,8 @@
 *
 !app/
 !app/**
+!gateway/
+!gateway/**
 !requirements.txt
 !run.py
 !channels.example.txt
