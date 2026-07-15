@@ -22,9 +22,14 @@ DOWNLOAD_CACHE_DIR = ROOT / "data" / "downloads"
 # PC save location when you pick "Desktop folder" / PC folder from the UI
 _default_dl = Path(r"C:\Users\Tommy\Documents\3D Files\Telegram  Unorganized")
 DOWNLOAD_DIR = Path(os.getenv("STL_DOWNLOAD_DIR", str(_default_dl))).expanduser()
-# Parallel download workers (official Telegram uses several; Telethon default is 1)
-DOWNLOAD_CONNECTIONS = int(os.getenv("STL_DOWNLOAD_CONNECTIONS", "12"))
-DOWNLOAD_PART_KB = int(os.getenv("STL_DOWNLOAD_PART_KB", "512"))  # max Telegram allows
+# Parallel connections inside one file download (Telegram max part size 512 KB).
+# Keep low when multiple files download at once — a global budget (~12) is shared.
+DOWNLOAD_CONNECTIONS = int(os.getenv("STL_DOWNLOAD_CONNECTIONS", "4"))
+DOWNLOAD_PART_KB = int(os.getenv("STL_DOWNLOAD_PART_KB", "512"))
+# How many separate file downloads can run at once (queue still accepts more)
+DOWNLOAD_JOB_CONCURRENCY = int(os.getenv("STL_DOWNLOAD_JOB_CONCURRENCY", "4"))
+# Hard cap on simultaneous media TCP streams across ALL downloads
+DOWNLOAD_CONN_BUDGET = int(os.getenv("STL_DOWNLOAD_CONN_BUDGET", "12"))
 
 DISCOVERY_QUERIES = (
     "stl",

@@ -91,6 +91,7 @@ from app.config import (
     DOWNLOAD_DIR,
     DOWNLOAD_HISTORY_FILE,
     DOWNLOAD_INDEX_FILE,
+    DOWNLOAD_JOB_CONCURRENCY,
     DOWNLOAD_PART_KB,
     DEEP_CRAWL_MAX_ROOTS,
     DEEP_CRAWL_MAX_INSPECT,
@@ -232,10 +233,9 @@ class TelegramService:
         self._web_join_thread = None
         self._preview_tasks: set[asyncio.Task] = set()
         self._preview_sem = asyncio.Semaphore(3)
-        self._download_lock = asyncio.Lock()
         self._download_jobs: dict[str, dict[str, Any]] = {}
         self._download_queue: asyncio.Queue[str] = asyncio.Queue()
-        self._download_worker_task: asyncio.Task | None = None
+        self._download_worker_tasks: list[asyncio.Task] = []
         self._download_job_seq = 0
         self._logged_out = False
 
@@ -3623,37 +3623,36 @@ class TelegramService:
             return
         archive = Path(job.get("path") or "")
         dest_dir = DOWNLOAD_DIR
-        async with self._download_lock:
-            try:
-                if job.get("cancel_requested"):
-                    self._mark_job_cancelled(job, archive)
-                    return
-                job["status"] = "running"
-                job["extracting"] = True
-                extracted = await asyncio.to_thread(
-                    extract_download_archive,
-                    archive,
-                    dest_dir,
-                    allow_duplicate=True,
-                )
-                job["extracted"] = True
-                job["extract_note"] = extracted.note
-                job["path"] = str(extracted.path)
-                job["filename"] = extracted.path.name
-                job["folder"] = str(extracted.path.parent.resolve())
-                job["progress"] = 100.0
-                job["status"] = "done"
-                job["finished_at"] = datetime.now(timezone.utc).isoformat()
-                self._record_download_history(job)
-            except Exception as exc:
-                logger.warning("Resume extract failed for %s: %s", job_id, exc)
-                job["extracted"] = False
-                job["extract_note"] = f"Saved archive (extract failed: {exc})"
-                job["status"] = "done"
-                job["finished_at"] = datetime.now(timezone.utc).isoformat()
-                self._record_download_history(job)
-            finally:
-                job["extracting"] = False
+        try:
+            if job.get("cancel_requested"):
+                self._mark_job_cancelled(job, archive)
+                return
+            job["status"] = "running"
+            job["extracting"] = True
+            extracted = await asyncio.to_thread(
+                extract_download_archive,
+                archive,
+                dest_dir,
+                allow_duplicate=True,
+            )
+            job["extracted"] = True
+            job["extract_note"] = extracted.note
+            job["path"] = str(extracted.path)
+            job["filename"] = extracted.path.name
+            job["folder"] = str(extracted.path.parent.resolve())
+            job["progress"] = 100.0
+            job["status"] = "done"
+            job["finished_at"] = datetime.now(timezone.utc).isoformat()
+            self._record_download_history(job)
+        except Exception as exc:
+            logger.warning("Resume extract failed for %s: %s", job_id, exc)
+            job["extracted"] = False
+            job["extract_note"] = f"Saved archive (extract failed: {exc})"
+            job["status"] = "done"
+            job["finished_at"] = datetime.now(timezone.utc).isoformat()
+            self._record_download_history(job)
+        finally:
+            job["extracting"] = False
 
     def cancel_download(self, job_id: str) -> dict[str, Any] | None:
         """Cancel a queued or running download."""
@@ -3691,14 +3690,20 @@ class TelegramService:
         self._record_download_history(job)
 
     def _ensure_download_worker(self) -> None:
-        task = self._download_worker_task
-        if task is not None and not task.done():
-            return
+        """Keep a pool of workers so several downloads run in parallel."""
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        self._download_worker_task = loop.create_task(self._download_worker_loop())
+        wanted = max(1, min(8, int(DOWNLOAD_JOB_CONCURRENCY or 4)))
+        # Drop finished tasks
+        self._download_worker_tasks = [
+            t for t in self._download_worker_tasks if not t.done()
+        ]
+        while len(self._download_worker_tasks) < wanted:
+            self._download_worker_tasks.append(
+                loop.create_task(self._download_worker_loop())
+            )
 
     async def _download_worker_loop(self) -> None:
         while True:
@@ -3725,211 +3730,213 @@ class TelegramService:
         final_path: Path | None = None
         partial: Path | None = None
 
-        async with self._download_lock:
-            try:
+        try:
+            if job.get("cancel_requested"):
+                self._mark_job_cancelled(job)
+                return
+            entity = await self.client.get_entity(name)
+            message = await self.client.get_messages(entity, ids=mid)
+            if not message or not getattr(message, "document", None):
+                self._fail_download_job(job, "No file found on that message.")
+                return
+
+            file_name = self._file_name(message) or job["filename"]
+            job["filename"] = file_name
+            job["source_filename"] = file_name
+            dest_dir = DOWNLOAD_DIR if to_desktop else DOWNLOAD_CACHE_DIR
+            job["folder"] = str(dest_dir.resolve())
+            allow_dup = bool(job.get("allow_duplicate"))
+            desired = dest_dir / self._safe_filename(file_name)
+
+            if to_desktop and not allow_dup:
+                # Disk checks: living files/folders + prior extract path if still present
+                pre_conflicts = self._desktop_conflicts_for_filename(file_name)
+                for c in self._index_conflicts(name, mid, file_name):
+                    if not any(x["path"] == c["path"] for x in pre_conflicts):
+                        pre_conflicts.append(c)
+                if pre_conflicts:
+                    c0 = pre_conflicts[0]
+                    job["status"] = "needs_confirm"
+                    job["conflict"] = {
+                        "kind": c0["kind"],
+                        "name": c0["name"],
+                        "path": c0["path"],
+                        "suggested": c0["suggested"],
+                        "phase": "download",
+                    }
+                    job["error"] = None
+                    return
+
+            if to_desktop and not allow_dup:
+                final_path = desired
+            else:
+                final_path = self._unique_path(dest_dir, file_name)
+            partial = self._partial_path(final_path)
+            job["partial_path"] = str(partial)
+            total_hint = int(getattr(message.document, "size", 0) or 0)
+            if total_hint:
+                job["total"] = total_hint
+
+            def progress(current: int, total: int) -> None:
                 if job.get("cancel_requested"):
-                    self._mark_job_cancelled(job)
-                    return
-                entity = await self.client.get_entity(name)
-                message = await self.client.get_messages(entity, ids=mid)
-                if not message or not getattr(message, "document", None):
-                    self._fail_download_job(job, "No file found on that message.")
-                    return
-
-                file_name = self._file_name(message) or job["filename"]
-                job["filename"] = file_name
-                job["source_filename"] = file_name
-                dest_dir = DOWNLOAD_DIR if to_desktop else DOWNLOAD_CACHE_DIR
-                job["folder"] = str(dest_dir.resolve())
-                allow_dup = bool(job.get("allow_duplicate"))
-                desired = dest_dir / self._safe_filename(file_name)
-
-                if to_desktop and not allow_dup:
-                    # Disk checks: living files/folders + prior extract path if still present
-                    pre_conflicts = self._desktop_conflicts_for_filename(file_name)
-                    for c in self._index_conflicts(name, mid, file_name):
-                        if not any(x["path"] == c["path"] for x in pre_conflicts):
-                            pre_conflicts.append(c)
-                    if pre_conflicts:
-                        c0 = pre_conflicts[0]
-                        job["status"] = "needs_confirm"
-                        job["conflict"] = {
-                            "kind": c0["kind"],
-                            "name": c0["name"],
-                            "path": c0["path"],
-                            "suggested": c0["suggested"],
-                            "phase": "download",
-                        }
-                        job["error"] = None
-                        return
-
-                if to_desktop and not allow_dup:
-                    final_path = desired
+                    raise DownloadCancelled()
+                t = int(total or total_hint or 0)
+                job["received"] = int(current or 0)
+                job["total"] = t
+                if t > 0:
+                    job["progress"] = round(min(100.0, (current / t) * 100.0), 1)
                 else:
-                    final_path = self._unique_path(dest_dir, file_name)
-                partial = self._partial_path(final_path)
-                job["partial_path"] = str(partial)
-                total_hint = int(getattr(message.document, "size", 0) or 0)
-                if total_hint:
-                    job["total"] = total_hint
+                    job["progress"] = 0.0
 
-                def progress(current: int, total: int) -> None:
-                    if job.get("cancel_requested"):
-                        raise DownloadCancelled()
-                    t = int(total or total_hint or 0)
-                    job["received"] = int(current or 0)
-                    job["total"] = t
-                    if t > 0:
-                        job["progress"] = round(min(100.0, (current / t) * 100.0), 1)
-                    else:
-                        job["progress"] = 0.0
+            def should_cancel() -> bool:
+                return bool(job.get("cancel_requested"))
 
-                def should_cancel() -> bool:
-                    return bool(job.get("cancel_requested"))
+            # Always write to a temp .tgdlpart; only promote on success.
+            self._delete_download_artifact(partial)
+            try:
+                # Share media connections across concurrent jobs (avoid DC stalls).
+                jobs_n = max(1, min(8, int(DOWNLOAD_JOB_CONCURRENCY or 4)))
+                per_file = max(2, min(int(DOWNLOAD_CONNECTIONS or 4), max(2, 12 // jobs_n)))
+                path = await parallel_download_to_path(
+                    self.client,
+                    message.document,
+                    str(partial),
+                    progress_callback=progress,
+                    should_cancel=should_cancel,
+                    part_size_kb=float(DOWNLOAD_PART_KB),
+                    max_connections=per_file,
+                )
+            except DownloadCancelled:
+                self._mark_job_cancelled(job, partial, final_path)
+                return
+            except Exception as parallel_exc:
+                if job.get("cancel_requested"):
+                    self._mark_job_cancelled(job, partial, final_path)
+                    return
+                logger.warning(
+                    "Parallel download failed (@%s/%s), falling back: %s",
+                    name,
+                    mid,
+                    parallel_exc,
+                )
+                from telethon.tl.types import InputDocumentFileLocation
 
-                # Always write to a temp .tgdlpart; only promote on success.
+                loc = InputDocumentFileLocation(
+                    id=message.document.id,
+                    access_hash=message.document.access_hash,
+                    file_reference=message.document.file_reference,
+                    thumb_size="",
+                )
                 self._delete_download_artifact(partial)
                 try:
-                    path = await parallel_download_to_path(
-                        self.client,
-                        message.document,
-                        str(partial),
-                        progress_callback=progress,
-                        should_cancel=should_cancel,
+                    path = await self.client.download_file(
+                        loc,
+                        file=str(partial),
                         part_size_kb=float(DOWNLOAD_PART_KB),
-                        max_connections=DOWNLOAD_CONNECTIONS,
+                        file_size=total_hint or None,
+                        progress_callback=progress,
                     )
                 except DownloadCancelled:
                     self._mark_job_cancelled(job, partial, final_path)
                     return
-                except Exception as parallel_exc:
-                    if job.get("cancel_requested"):
-                        self._mark_job_cancelled(job, partial, final_path)
-                        return
-                    logger.warning(
-                        "Parallel download failed (@%s/%s), falling back: %s",
-                        name,
-                        mid,
-                        parallel_exc,
-                    )
-                    from telethon.tl.types import InputDocumentFileLocation
-
-                    loc = InputDocumentFileLocation(
-                        id=message.document.id,
-                        access_hash=message.document.access_hash,
-                        file_reference=message.document.file_reference,
-                        thumb_size="",
-                    )
-                    self._delete_download_artifact(partial)
-                    try:
-                        path = await self.client.download_file(
-                            loc,
-                            file=str(partial),
-                            part_size_kb=float(DOWNLOAD_PART_KB),
-                            file_size=total_hint or None,
-                            progress_callback=progress,
-                        )
-                    except DownloadCancelled:
-                        self._mark_job_cancelled(job, partial, final_path)
-                        return
-                if job.get("cancel_requested"):
-                    self._mark_job_cancelled(job, partial, final_path)
-                    return
-                if not path:
-                    self._fail_download_job(
-                        job, "Telegram returned no file.", partial, final_path
-                    )
-                    return
-                out = Path(path)
-                if not out.exists() or out.stat().st_size <= 0:
-                    self._fail_download_job(
-                        job, "Download produced an empty file.", partial, final_path
-                    )
-                    return
-
-                # Promote partial → final name
-                try:
-                    if final_path.exists():
-                        # Never overwrite an existing file (race / unexpected).
-                        final_path = self._unique_path(
-                            final_path.parent, final_path.name
-                        )
-                    out.replace(final_path)
-                except Exception:
-                    # Cross-device fallback
-                    final_path.write_bytes(out.read_bytes())
-                    self._delete_download_artifact(out)
-
-                job["path"] = str(final_path.resolve())
-                job["filename"] = final_path.name
-                job["partial_path"] = None
-                job["received"] = final_path.stat().st_size
-                job["total"] = job["total"] or final_path.stat().st_size
-                job["progress"] = 100.0
-
-                # Desktop ZIP/RAR → auto-extract (single root folder unwraps;
-                # otherwise contain under a folder named like the archive).
-                if to_desktop and is_extractable_archive(final_path):
-                    if job.get("cancel_requested"):
-                        self._mark_job_cancelled(job, final_path)
-                        return
-                    job["extracting"] = True
-                    try:
-                        extracted = await asyncio.to_thread(
-                            extract_download_archive,
-                            final_path,
-                            dest_dir,
-                            allow_duplicate=allow_dup,
-                        )
-                        job["extracted"] = True
-                        job["extract_note"] = extracted.note
-                        job["path"] = str(extracted.path)
-                        job["filename"] = extracted.path.name
-                        job["folder"] = str(extracted.path.parent.resolve())
-                    except DestinationExists as conflict:
-                        job["extracted"] = False
-                        job["status"] = "needs_confirm"
-                        job["conflict"] = {
-                            "kind": conflict.kind,
-                            "name": conflict.existing.name,
-                            "path": str(conflict.existing.resolve()),
-                            "suggested": conflict.suggested_name,
-                            "phase": "extract",
-                        }
-                        job["extract_note"] = (
-                            f"Downloaded — “{conflict.existing.name}” already exists"
-                        )
-                        job["extracting"] = False
-                        return
-                    except Exception as extract_exc:
-                        logger.warning(
-                            "Download OK but extract failed for %s: %s",
-                            final_path.name,
-                            extract_exc,
-                        )
-                        job["extracted"] = False
-                        job["extract_note"] = f"Saved archive (extract failed: {extract_exc})"
-                    finally:
-                        job["extracting"] = False
-
-                job["status"] = "done"
-                job["finished_at"] = datetime.now(timezone.utc).isoformat()
-                self._record_download_history(job)
-            except DownloadCancelled:
+            if job.get("cancel_requested"):
                 self._mark_job_cancelled(job, partial, final_path)
-            except FloodWaitError as exc:
-                if job.get("cancel_requested"):
-                    self._mark_job_cancelled(job, partial, final_path)
-                    return
+                return
+            if not path:
                 self._fail_download_job(
-                    job, f"Rate limited — wait {exc.seconds}s", partial, final_path
+                    job, "Telegram returned no file.", partial, final_path
                 )
-            except Exception as exc:
+                return
+            out = Path(path)
+            if not out.exists() or out.stat().st_size <= 0:
+                self._fail_download_job(
+                    job, "Download produced an empty file.", partial, final_path
+                )
+                return
+
+            # Promote partial → final name
+            try:
+                if final_path.exists():
+                    # Never overwrite an existing file (race / unexpected).
+                    final_path = self._unique_path(
+                        final_path.parent, final_path.name
+                    )
+                out.replace(final_path)
+            except Exception:
+                # Cross-device fallback
+                final_path.write_bytes(out.read_bytes())
+                self._delete_download_artifact(out)
+
+            job["path"] = str(final_path.resolve())
+            job["filename"] = final_path.name
+            job["partial_path"] = None
+            job["received"] = final_path.stat().st_size
+            job["total"] = job["total"] or final_path.stat().st_size
+            job["progress"] = 100.0
+
+            # Desktop ZIP/RAR → auto-extract (single root folder unwraps;
+            # otherwise contain under a folder named like the archive).
+            if to_desktop and is_extractable_archive(final_path):
                 if job.get("cancel_requested"):
-                    self._mark_job_cancelled(job, partial, final_path)
+                    self._mark_job_cancelled(job, final_path)
                     return
-                logger.exception("Download failed for @%s/%s", name, mid)
-                self._fail_download_job(job, str(exc), partial, final_path)
+                job["extracting"] = True
+                try:
+                    extracted = await asyncio.to_thread(
+                        extract_download_archive,
+                        final_path,
+                        dest_dir,
+                        allow_duplicate=allow_dup,
+                    )
+                    job["extracted"] = True
+                    job["extract_note"] = extracted.note
+                    job["path"] = str(extracted.path)
+                    job["filename"] = extracted.path.name
+                    job["folder"] = str(extracted.path.parent.resolve())
+                except DestinationExists as conflict:
+                    job["extracted"] = False
+                    job["status"] = "needs_confirm"
+                    job["conflict"] = {
+                        "kind": conflict.kind,
+                        "name": conflict.existing.name,
+                        "path": str(conflict.existing.resolve()),
+                        "suggested": conflict.suggested_name,
+                        "phase": "extract",
+                    }
+                    job["extract_note"] = (
+                        f"Downloaded — “{conflict.existing.name}” already exists"
+                    )
+                    job["extracting"] = False
+                    return
+                except Exception as extract_exc:
+                    logger.warning(
+                        "Download OK but extract failed for %s: %s",
+                        final_path.name,
+                        extract_exc,
+                    )
+                    job["extracted"] = False
+                    job["extract_note"] = f"Saved archive (extract failed: {extract_exc})"
+                finally:
+                    job["extracting"] = False
+
+            job["status"] = "done"
+            job["finished_at"] = datetime.now(timezone.utc).isoformat()
+            self._record_download_history(job)
+        except DownloadCancelled:
+            self._mark_job_cancelled(job, partial, final_path)
+        except FloodWaitError as exc:
+            if job.get("cancel_requested"):
+                self._mark_job_cancelled(job, partial, final_path)
+                return
+            self._fail_download_job(
+                job, f"Rate limited — wait {exc.seconds}s", partial, final_path
+            )
+        except Exception as exc:
+            if job.get("cancel_requested"):
+                self._mark_job_cancelled(job, partial, final_path)
+                return
+            logger.exception("Download failed for @%s/%s", name, mid)
+            self._fail_download_job(job, str(exc), partial, final_path)
 
     async def download_telegram_file(
         self,
