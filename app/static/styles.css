@@ -51,6 +51,43 @@ a:hover {
   padding: 1.5rem 0 4rem;
 }
 
+.site-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  min-width: 0;
+}
+
+.instance-chip {
+  display: inline-flex;
+  align-items: center;
+  max-width: 14rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  line-height: 1;
+  padding: 0.35rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid rgba(238, 244, 239, 0.14);
+  color: var(--muted);
+  background: rgba(238, 244, 239, 0.06);
+}
+
+.instance-chip.is-windows {
+  color: #d8f0c8;
+  border-color: rgba(140, 198, 90, 0.35);
+  background: rgba(140, 198, 90, 0.12);
+}
+
+.instance-chip.is-synology {
+  color: #c9dff8;
+  border-color: rgba(110, 168, 220, 0.35);
+  background: rgba(110, 168, 220, 0.12);
+}
+
 .site-top {
   display: flex;
   align-items: center;

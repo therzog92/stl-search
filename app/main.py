@@ -15,7 +15,14 @@ from app.crypto_accel import install_tgcrypto_for_telethon
 install_tgcrypto_for_telethon()
 
 from app.catalog import has_api_key as telemetr_has_key
-from app.config import DOWNLOAD_DIR, MAX_AGE_DAYS, MIN_CHANNEL_MEMBERS, THUMBS_DIR
+from app.config import (
+    DOWNLOAD_DIR,
+    MAX_AGE_DAYS,
+    MIN_CHANNEL_MEMBERS,
+    STL_HOSTNAME,
+    STL_INSTANCE,
+    THUMBS_DIR,
+)
 from app.settings_store import mask_secret
 from app.telegram_service import telegram_service
 from app.variants import generate_variants
@@ -97,7 +104,18 @@ def _auth_redirect():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "discovery_running": telegram_service.discovery_state.running}
+    instance = STL_INSTANCE if STL_INSTANCE in ("windows", "synology") else "windows"
+    download_label = (
+        "PC folder" if instance == "windows" else "NAS folder"
+    )
+    return {
+        "ok": True,
+        "discovery_running": telegram_service.discovery_state.running,
+        "instance": instance,
+        "hostname": STL_HOSTNAME,
+        "download_dir": str(DOWNLOAD_DIR),
+        "download_label": download_label,
+    }
 
 
 @app.get("/", response_class=HTMLResponse)

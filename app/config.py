@@ -31,6 +31,12 @@ DOWNLOAD_JOB_CONCURRENCY = int(os.getenv("STL_DOWNLOAD_JOB_CONCURRENCY", "4"))
 # Hard cap on simultaneous media TCP streams across ALL downloads
 DOWNLOAD_CONN_BUDGET = int(os.getenv("STL_DOWNLOAD_CONN_BUDGET", "12"))
 
+# Which deployment this process is (shown in UI badge / used by gateway)
+STL_INSTANCE = (os.getenv("STL_INSTANCE") or "windows").strip().lower()
+STL_HOSTNAME = (os.getenv("STL_HOSTNAME") or "").strip() or (
+    "synology" if STL_INSTANCE == "synology" else "windows"
+)
+
 DISCOVERY_QUERIES = (
     "stl",
     "free stl",

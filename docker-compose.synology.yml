@@ -5,12 +5,17 @@
 #   TELEGRAM_API_ID, TELEGRAM_API_HASH
 # Optional: TELEMETR_API_KEY
 # Or copy .env + data/*.session from your PC via sync-to-synology.ps1
+#
+# Gateway (port 8788): prefers Windows PC STL Search when healthy, else this NAS.
+# Point DSM Reverse Proxy at localhost:8788 (not :8787) for remote HTTPS access.
+# Reserve / fix your PC LAN IP, or set STL_WINDOWS_UPSTREAM in .env.
 
 services:
   stl-search:
     image: ghcr.io/therzog92/stl-search:latest
     container_name: stl-search
     restart: unless-stopped
+    # LAN can still hit the NAS app directly; remote HTTPS should use the gateway.
     ports:
       - "8787:8787"
     env_file:
@@ -19,8 +24,36 @@ services:
       STL_HOST: "0.0.0.0"
       STL_PORT: "8787"
       STL_DOWNLOAD_DIR: "/downloads"
+      STL_INSTANCE: "synology"
+      STL_HOSTNAME: "synology"
     volumes:
       # Telegram session, discovered channels, join/mute log
       - /volume1/docker/stl-search/data:/app/data
       - "/volume1/NAS_Shared/Telegram STLs:/downloads"
       - /volume1/docker/stl-search/channels.txt:/app/channels.txt:ro
+
+  stl-gateway:
+    image: ghcr.io/therzog92/stl-search:latest
+    container_name: stl-gateway
+    restart: unless-stopped
+    depends_on:
+      - stl-search
+    ports:
+      - "8788:8788"
+    environment:
+      # Override in /volume1/docker/stl-search/.env if your PC IP changes
+      STL_WINDOWS_UPSTREAM: "${STL_WINDOWS_UPSTREAM:-http://192.168.0.88:8787}"
+      STL_NAS_UPSTREAM: "http://stl-search:8787"
+      STL_GATEWAY_CHECK_INTERVAL: "3"
+      STL_GATEWAY_CHECK_TIMEOUT: "2"
+    command:
+      [
+        "python",
+        "-m",
+        "uvicorn",
+        "gateway.app:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8788",
+      ]

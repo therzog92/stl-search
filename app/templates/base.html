@@ -15,7 +15,15 @@
   <body class="{% block body_class %}{% endblock %}">
     {% block topbar %}
     <header class="site-top">
-      <a class="site-logo" href="/">STL Search</a>
+      <div class="site-brand">
+        <a class="site-logo" href="/">STL Search</a>
+        <span
+          class="instance-chip"
+          id="instance-chip"
+          title="Which server is handling this page"
+          hidden
+        ></span>
+      </div>
       <nav class="site-nav" aria-label="Main">
         <a class="site-nav-link" href="/" data-nav="home">Home</a>
         <a class="site-nav-link" href="/#favorites" data-nav="favorites">Favorites</a>
@@ -59,6 +67,32 @@
         }
         syncNav();
         window.addEventListener("hashchange", syncNav);
+
+        const chip = document.getElementById("instance-chip");
+        async function syncInstanceChip() {
+          if (!chip) return;
+          try {
+            const res = await fetch("/health", { headers: { Accept: "application/json" } });
+            if (!res.ok) return;
+            const data = await res.json();
+            const instance = (data.instance || "").toLowerCase();
+            const host = data.hostname || instance || "server";
+            const folder =
+              data.download_label ||
+              (instance === "synology" ? "NAS folder" : "PC folder");
+            const label =
+              instance === "synology"
+                ? `Synology · ${folder}`
+                : `Windows · ${folder}`;
+            chip.textContent = label;
+            chip.title = `${host} — downloads: ${data.download_dir || folder}`;
+            chip.hidden = false;
+            chip.classList.toggle("is-windows", instance !== "synology");
+            chip.classList.toggle("is-synology", instance === "synology");
+          } catch (e) {}
+        }
+        syncInstanceChip();
+        window.setInterval(syncInstanceChip, 15000);
 
         const topBtn = document.getElementById("back-to-top");
         if (topBtn) {

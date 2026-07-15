@@ -22,11 +22,12 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY gateway ./gateway
 COPY run.py .
 COPY channels.example.txt ./channels.txt
 
 RUN mkdir -p /app/data /downloads
 
-EXPOSE 8787
+EXPOSE 8787 8788
 
 CMD ["python", "run.py"]

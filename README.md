@@ -47,16 +47,32 @@ Log in with Telegram once. Downloads go to:
 `/volume1/NAS_Shared/Telegram STLs`
 
 ### Outside your house (like Jellyfin)
+
+Use the **gateway** so remote HTTPS prefers your Windows PC (PC-folder downloads)
+and falls back to the NAS container when the PC is offline.
+
 DSM → **Login Portal / Reverse Proxy** → new rule:
 
 | | |
 |---|---|
 | Source | `https://stl.yourdomain.com` port `443` |
-| Destination | `http://localhost` port `8787` |
+| Destination | `http://localhost` port **`8788`** (gateway) |
 
 Assign your Let's Encrypt certificate to that hostname (same workflow as Jellyfin).
 
-> Do **not** port-forward `8787` to the internet. Use HTTPS reverse proxy (or Tailscale).
+Optional in `/volume1/docker/stl-search/.env` if your PC’s LAN IP changes:
+
+```env
+STL_WINDOWS_UPSTREAM=http://192.168.0.88:8787
+```
+
+Give the PC a DHCP reservation so that IP stays stable. Allow Windows Firewall TCP **8787** from the NAS (see `install-windows-firewall.ps1`).
+
+> Do **not** port-forward `8787`/`8788` to the internet. Use HTTPS reverse proxy (or Tailscale).
+
+**Telegram session:** don’t leave Windows STL Search and the NAS app both connected on the same session. For remote PC downloads, leave the Windows app running; quit it before relying on the NAS Telegram client.
+
+The UI header shows **Windows · PC folder** or **Synology · NAS folder** for whichever backend answered.
 
 ---
 
@@ -72,6 +88,8 @@ Uses your OpenSSH host `synology-nas` (or set `-SshHost`). Transfers `.env`,
 `data/stl_search.session`, channel lists, and join log; pulls `:latest` and restarts.
 
 Don’t run the Windows app and the NAS container on the **same session file** at once.
+Remote HTTPS via the gateway (`:8788`) will prefer Windows when it’s up — quit the
+Windows app if you need the NAS instance to own Telegram.
 
 ---
 
