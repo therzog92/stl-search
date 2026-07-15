@@ -13,6 +13,26 @@ from dataclasses import dataclass
 _LINE_OR = re.compile(r"\s*(?:\||\bOR\b)\s*", re.IGNORECASE)
 
 
+_SEP_CHARS = re.compile(r"[\s_\-]+")
+
+
+def _hay_contains_query(query: str, hay: str) -> bool:
+    """True if query appears in hay (literal or ignoring spaces/_/-).
+
+    Blocks Telegram fuzzy matches like gay→gary or penis→peny.
+    Still allows gojo life ↔ gojo_life via separator folding.
+    """
+    q = (query or "").strip()
+    if not q:
+        return True
+    h = hay or ""
+    if q.casefold() in h.casefold():
+        return True
+    qn = _SEP_CHARS.sub("", q.casefold())
+    hn = _SEP_CHARS.sub("", h.casefold())
+    return bool(qn) and qn in hn
+
+
 @dataclass(frozen=True)
 class SearchVariant:
     """One Telegram API search string, with optional local wildcard filter."""
@@ -24,10 +44,13 @@ class SearchVariant:
     match_re: re.Pattern[str] | None = None
 
     def matches_text(self, file_name: str, text: str) -> bool:
-        if self.match_re is None:
-            return True
         hay = f"{file_name or ''}\n{text or ''}"
-        return self.match_re.search(hay) is not None
+        if self.match_re is not None:
+            return self.match_re.search(hay) is not None
+        # Telegram fuzzy-matches tokens — require the real query text to appear.
+        return _hay_contains_query(self.telegram_query, hay) or _hay_contains_query(
+            self.label, hay
+        )
 
 
 def split_or_terms(query: str) -> list[str]:

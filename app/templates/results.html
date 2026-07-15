@@ -81,7 +81,12 @@
         </label>
       </div>
     </div>
-    <div class="results-filters" id="results-filters">
+    <details class="results-filters-wrap" id="results-filters-wrap">
+      <summary class="results-filters-toggle">
+        <span>Filters</span>
+        <span class="results-filter-count hint" id="filter-count"></span>
+      </summary>
+      <div class="results-filters" id="results-filters">
       <label class="results-tool">
         <span>Name</span>
         <input type="search" id="filter-name" placeholder="Filter filename…" autocomplete="off" />
@@ -114,8 +119,8 @@
           <option value="10737418240">≥ 10 GB</option>
         </select>
       </label>
-      <span class="results-filter-count hint" id="filter-count"></span>
-    </div>
+      </div>
+    </details>
     <p class="hint" id="sort-hint" style="margin-bottom: 1rem">
       {% if browse %}Showing newest posts first as files load.{% else %}Sorted by earliest channel post for each file (newest first).{% endif %}
     </p>
@@ -704,9 +709,16 @@
     }
   }
 
+  // Filters collapsed on phones; open by default on wider screens
+  const filtersWrap = document.getElementById("results-filters-wrap");
+  if (filtersWrap && window.matchMedia("(min-width: 720px)").matches) {
+    filtersWrap.open = true;
+  }
+
   tick();
 
   document.getElementById("sort-select")?.addEventListener("change", (ev) => {
+
     setSortMode(ev.target.value);
   });
   ["filter-name", "filter-channel"].forEach((id) => {

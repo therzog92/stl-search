@@ -876,12 +876,57 @@ a.btn-xs {
   gap: 0.55rem 0.75rem;
 }
 
-.results-filters {
+.results-filters-wrap {
   margin-bottom: 0.65rem;
-  padding: 0.65rem 0.75rem;
   border: 1px solid var(--line);
   border-radius: 12px;
   background: rgba(0, 0, 0, 0.18);
+}
+
+.results-filters-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+  padding: 0.55rem 0.75rem;
+  font-size: 0.86rem;
+  font-weight: 650;
+  color: var(--ink);
+}
+
+.results-filters-toggle::-webkit-details-marker {
+  display: none;
+}
+
+.results-filters-toggle::after {
+  content: "▸";
+  color: var(--muted);
+  font-size: 0.75rem;
+  transition: transform 0.15s ease;
+}
+
+.results-filters-wrap[open] > .results-filters-toggle::after {
+  transform: rotate(90deg);
+}
+
+.results-filters {
+  margin-bottom: 0;
+  padding: 0 0.75rem 0.7rem;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.results-filter-count {
+  margin-left: auto;
+  align-self: center;
+  font-size: 0.8rem;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
 }
 
 .results-tool {
@@ -934,12 +979,6 @@ a.btn-xs {
   font-weight: 600;
   font-size: 0.82rem;
   padding-bottom: 0.35rem;
-}
-
-.results-filter-count {
-  margin-left: auto;
-  align-self: center;
-  font-size: 0.8rem;
 }
 
 .sort-toggle {
