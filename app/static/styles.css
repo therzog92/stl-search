@@ -54,14 +54,16 @@ a:hover {
 .site-brand {
   display: flex;
   align-items: center;
-  gap: 0.65rem;
+  gap: 0.5rem;
   min-width: 0;
+  flex: 1 1 auto;
 }
 
 .instance-chip {
   display: inline-flex;
   align-items: center;
-  max-width: 14rem;
+  flex: 0 1 auto;
+  max-width: min(14rem, 42vw);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -74,6 +76,16 @@ a:hover {
   border: 1px solid rgba(238, 244, 239, 0.14);
   color: var(--muted);
   background: rgba(238, 244, 239, 0.06);
+}
+
+.instance-chip-short {
+  display: none;
+}
+
+.instance-chip-full {
+  display: inline;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .instance-chip.is-windows {
@@ -92,10 +104,12 @@ a:hover {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 1rem;
+  gap: 0.75rem;
   width: min(1120px, calc(100% - 2rem));
   margin: 0 auto;
   padding: 1rem 0 0.25rem;
+  position: relative;
+  z-index: 40;
 }
 
 .site-logo {
@@ -105,6 +119,8 @@ a:hover {
   letter-spacing: -0.02em;
   color: var(--ink);
   text-decoration: none;
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .site-logo:hover {
@@ -116,6 +132,7 @@ a:hover {
   display: flex;
   align-items: center;
   gap: 0.15rem;
+  flex: 0 0 auto;
   padding: 0.2rem;
   border: 1px solid var(--line);
   border-radius: 999px;
@@ -127,9 +144,14 @@ a:hover {
   text-decoration: none;
   font-size: 0.86rem;
   font-weight: 500;
-  padding: 0.4rem 0.85rem;
+  padding: 0.4rem 0.75rem;
   border-radius: 999px;
   transition: color 0.15s ease, background 0.15s ease;
+  border: 0;
+  background: transparent;
+  font-family: inherit;
+  cursor: pointer;
+  white-space: nowrap;
 }
 
 .site-nav-link:hover {
@@ -145,6 +167,61 @@ a:hover {
 
 .site-nav-link.is-active:hover {
   color: var(--accent-ink);
+}
+
+.site-nav-more {
+  position: relative;
+}
+
+.site-nav-more-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.site-nav-caret {
+  font-size: 0.7rem;
+  opacity: 0.8;
+}
+
+.site-nav-menu {
+  position: absolute;
+  top: calc(100% + 0.4rem);
+  right: 0;
+  min-width: 9.5rem;
+  padding: 0.35rem;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(14, 24, 18, 0.96);
+  box-shadow: var(--shadow);
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.site-nav-menu[hidden] {
+  display: none !important;
+}
+
+.site-nav-menu-link {
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 0.86rem;
+  font-weight: 500;
+  padding: 0.55rem 0.7rem;
+  border-radius: 8px;
+}
+
+.site-nav-menu-link:hover {
+  color: var(--ink);
+  text-decoration: none;
+  background: rgba(238, 244, 239, 0.08);
+}
+
+.site-nav-menu-link.is-active {
+  color: var(--accent-ink);
+  background: var(--accent);
 }
 
 .channel-tools,
@@ -453,6 +530,44 @@ a.btn-xs {
 }
 
 @media (max-width: 640px) {
+  .site-top {
+    flex-wrap: nowrap;
+    gap: 0.5rem;
+    align-items: center;
+  }
+
+  .site-brand {
+    flex-wrap: wrap;
+    gap: 0.35rem 0.45rem;
+  }
+
+  .site-logo {
+    font-size: 1.02rem;
+  }
+
+  .instance-chip {
+    max-width: none;
+    padding: 0.28rem 0.45rem;
+    font-size: 0.68rem;
+  }
+
+  .instance-chip-short {
+    display: inline;
+  }
+
+  .instance-chip-full {
+    display: none;
+  }
+
+  .site-nav {
+    gap: 0;
+  }
+
+  .site-nav-link {
+    font-size: 0.78rem;
+    padding: 0.35rem 0.55rem;
+  }
+
   .channel-row {
     grid-template-columns: auto minmax(0, 1fr);
   }

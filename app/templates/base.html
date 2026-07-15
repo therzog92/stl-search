@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,700;1,9..40,400&family=Fraunces:opsz,wght@9..144,600&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=nav2" />
   </head>
   <body class="{% block body_class %}{% endblock %}">
     {% block topbar %}
@@ -22,14 +22,30 @@
           id="instance-chip"
           title="Which server is handling this page"
           hidden
-        ></span>
+        ><span class="instance-chip-short" id="instance-chip-short"></span><span class="instance-chip-full" id="instance-chip-full"></span></span>
       </div>
       <nav class="site-nav" aria-label="Main">
         <a class="site-nav-link" href="/" data-nav="home">Home</a>
-        <a class="site-nav-link" href="/#favorites" data-nav="favorites">Favorites</a>
-        <a class="site-nav-link" href="/manage" data-nav="manage">Manage</a>
         <a class="site-nav-link" href="/downloads" data-nav="downloads">Downloads</a>
-        <a class="site-nav-link" href="/settings" data-nav="settings">Settings</a>
+        <div class="site-nav-more" id="site-nav-more">
+          <button
+            type="button"
+            class="site-nav-link site-nav-more-btn"
+            id="site-nav-more-btn"
+            aria-expanded="false"
+            aria-haspopup="true"
+            aria-controls="site-nav-more-menu"
+            data-nav-more
+          >
+            Other
+            <span class="site-nav-caret" aria-hidden="true">▾</span>
+          </button>
+          <div class="site-nav-menu" id="site-nav-more-menu" hidden role="menu">
+            <a class="site-nav-menu-link" href="/#favorites" data-nav="favorites" role="menuitem">Favorites</a>
+            <a class="site-nav-menu-link" href="/manage" data-nav="manage" role="menuitem">Manage</a>
+            <a class="site-nav-menu-link" href="/settings" data-nav="settings" role="menuitem">Settings</a>
+          </div>
+        </div>
       </nav>
     </header>
     {% endblock %}
@@ -49,7 +65,8 @@
         function syncNav() {
           const path = location.pathname.replace(/\/$/, "") || "/";
           const hash = location.hash || "";
-          document.querySelectorAll(".site-nav-link[data-nav]").forEach((a) => {
+          let moreActive = false;
+          document.querySelectorAll("[data-nav]").forEach((a) => {
             const key = a.getAttribute("data-nav");
             let active = false;
             if (key === "home") {
@@ -63,12 +80,49 @@
             else if (key === "downloads") active = path === "/downloads";
             else if (key === "settings") active = path === "/settings";
             a.classList.toggle("is-active", active);
+            if (active && (key === "favorites" || key === "manage" || key === "settings")) {
+              moreActive = true;
+            }
           });
+          const moreBtn = document.getElementById("site-nav-more-btn");
+          if (moreBtn) moreBtn.classList.toggle("is-active", moreActive);
         }
         syncNav();
         window.addEventListener("hashchange", syncNav);
 
+        const moreWrap = document.getElementById("site-nav-more");
+        const moreBtn = document.getElementById("site-nav-more-btn");
+        const moreMenu = document.getElementById("site-nav-more-menu");
+        function closeMore() {
+          if (!moreBtn || !moreMenu) return;
+          moreMenu.hidden = true;
+          moreBtn.setAttribute("aria-expanded", "false");
+          moreWrap?.classList.remove("is-open");
+        }
+        function toggleMore() {
+          if (!moreBtn || !moreMenu) return;
+          const open = moreMenu.hidden;
+          moreMenu.hidden = !open;
+          moreBtn.setAttribute("aria-expanded", open ? "true" : "false");
+          moreWrap?.classList.toggle("is-open", open);
+        }
+        moreBtn?.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          toggleMore();
+        });
+        moreMenu?.querySelectorAll("a").forEach((a) => {
+          a.addEventListener("click", () => closeMore());
+        });
+        document.addEventListener("click", (ev) => {
+          if (!moreWrap?.contains(ev.target)) closeMore();
+        });
+        document.addEventListener("keydown", (ev) => {
+          if (ev.key === "Escape") closeMore();
+        });
+
         const chip = document.getElementById("instance-chip");
+        const chipShort = document.getElementById("instance-chip-short");
+        const chipFull = document.getElementById("instance-chip-full");
         async function syncInstanceChip() {
           if (!chip) return;
           try {
@@ -80,11 +134,13 @@
             const folder =
               data.download_label ||
               (instance === "synology" ? "NAS folder" : "PC folder");
-            const label =
+            const shortLabel = instance === "synology" ? "Synology" : "Windows";
+            const fullLabel =
               instance === "synology"
                 ? `Synology · ${folder}`
                 : `Windows · ${folder}`;
-            chip.textContent = label;
+            if (chipShort) chipShort.textContent = shortLabel;
+            if (chipFull) chipFull.textContent = fullLabel;
             chip.title = `${host} — downloads: ${data.download_dir || folder}`;
             chip.hidden = false;
             chip.classList.toggle("is-windows", instance !== "synology");
